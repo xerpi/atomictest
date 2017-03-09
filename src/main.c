@@ -43,7 +43,9 @@ int main(int argc, char *argv[])
 	printf("Device connectors: %d\n", mode_res->count_connectors);
 
 	for (i = 0; i < mode_res->count_connectors; i++) {
+		int j;
 		drmModeConnector *mode_conn;
+		drmModeEncoder *mode_enc;
 
 		printf("Connector %d\n", i);
 
@@ -53,6 +55,44 @@ int main(int argc, char *argv[])
 				mode_res->connectors[i]);
 			continue;
 		}
+
+		if (mode_conn->connection != DRM_MODE_CONNECTED) {
+			printf("Connector %d not connector, skipping...\n", i);
+			continue;
+		}
+
+		if (mode_conn->encoder_id) {
+			printf("There's a connected encoder already (id %d)\n",
+				mode_conn->encoder_id);
+			mode_enc = drmModeGetEncoder(fd, mode_conn->encoder_id);
+		} else {
+			mode_enc = NULL;
+		}
+
+		if (mode_enc) {
+			if (mode_enc->crtc_id) {
+				printf("The encoder is connected to the CRTC %d\n",
+					mode_enc->crtc_id);
+			}
+			drmModeFreeEncoder(mode_enc);
+		}
+
+		/*printf("  Connected: %d\n", (mode_conn->connection == DRM_MODE_CONNECTED));
+		printf("  Count modes: %d\n", mode_conn->count_modes);
+
+		for (j = 0; j < mode_conn->count_modes; j++) {
+			drmModeModeInfo *mode_info = &mode_conn->modes[j];
+
+			printf("    Mode %d\n", j);
+			printf("      clock: %d\n", mode_info->clock);
+			printf("      hdisplay: %d\n", mode_info->hdisplay);
+			printf("      vdisplay: %d\n", mode_info->vdisplay);
+			printf("      vrefresh: %d\n", mode_info->vrefresh);
+			printf("      flags: 0x%08X\n", mode_info->flags);
+			printf("      type: 0x%08X\n", mode_info->type);
+			printf("      name: %s\n", mode_info->name);
+
+		}*/
 
 		drmModeFreeConnector(mode_conn);
 
