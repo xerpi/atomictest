@@ -1,23 +1,96 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <config.h>
 
-int main(int argc, char *argv[])
+struct at_device {
+	int fd;
+
+	uint16_t width;
+	uint16_t height;
+
+	uint32_t connector;
+	uint32_t crtc;
+};
+
+struct at_dumb_buffer {
+	uint32_t width;
+	uint32_t height;
+
+	uint32_t handle;
+	uint32_t pitch;
+	uint64_t size;
+
+	uint32_t fb;
+
+	uint8_t *data;
+};
+
+static int setup_device(struct at_device *device, drmModeRes *resources,
+			drmModeConnector *connector)
+{
+	int i;
+	drmModeEncoder *encoder;
+
+	if (connector->encoder_id) {
+		printf("  there's a connected encoder (id %d)\n",
+			connector->encoder_id);
+		encoder = drmModeGetEncoder(device->fd, connector->encoder_id);
+	} else {
+		encoder = NULL;
+	}
+
+	if (encoder) {
+		if (encoder->crtc_id) {
+			printf("  the encoder is connected to the CRTC %d\n",
+				encoder->crtc_id);
+			device->crtc = encoder->crtc_id;
+			drmModeFreeEncoder(encoder);
+			return 0;
+		}
+		drmModeFreeEncoder(encoder);
+	}
+
+	for (i = 0; i < connector->count_encoders; i++) {
+		int j;
+
+		encoder = drmModeGetEncoder(device->fd, connector->encoders[i]);
+		if (!encoder)
+			continue;
+
+		for (j = 0; j < resources->count_crtcs; j++) {
+			if (!(encoder->possible_crtcs & (1 << j)))
+				continue;
+
+			printf("  crtc %d is available to this encoder\n", j);
+
+			device->crtc = resources->crtcs[j];
+			drmModeFreeEncoder(encoder);
+			return 0;
+		}
+
+		drmModeFreeEncoder(encoder);
+	}
+
+	return -1;
+}
+
+int at_device_open(struct at_device *device, const char *node)
 {
 	int i;
 	int fd;
 	int ret;
 	uint64_t cap_dumb;
-	drmModeRes *mode_res;
+	drmModeRes *resources;
 
-	printf("Hello from " PACKAGE_NAME ".\n");
-
-	fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+	fd = open(node, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		perror("Could not open input file");
 		return -1;
@@ -30,77 +103,188 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	mode_res = drmModeGetResources(fd);
-	if (!mode_res) {
+	resources = drmModeGetResources(fd);
+	if (!resources) {
 		fprintf(stderr, "drm: can't get mode resources\n");
 		close(fd);
 		return -1;
 	}
 
-	printf("Device fbs: %d\n", mode_res->count_fbs);
-	printf("Device crtcs: %d\n", mode_res->count_crtcs);
-	printf("Device encoders: %d\n", mode_res->count_encoders);
-	printf("Device connectors: %d\n", mode_res->count_connectors);
+	device->fd = fd;
 
-	for (i = 0; i < mode_res->count_connectors; i++) {
-		int j;
-		drmModeConnector *mode_conn;
-		drmModeEncoder *mode_enc;
+	printf("Device fbs: %d\n", resources->count_fbs);
+	printf("Device crtcs: %d\n", resources->count_crtcs);
+	printf("Device encoders: %d\n", resources->count_encoders);
+	printf("Device connectors: %d\n", resources->count_connectors);
 
-		printf("Connector %d\n", i);
+	/*
+	 * Get the first connected connector.
+	 */
+	for (i = 0; i < resources->count_connectors; i++) {
+		drmModeConnector *connector;
 
-		mode_conn = drmModeGetConnector(fd, mode_res->connectors[i]);
-		if (!mode_conn) {
-			fprintf(stderr, "drm: can't get mode connector %d\n",
-				mode_res->connectors[i]);
+		printf("\nTrying connector %d...\n", i);
+
+		connector = drmModeGetConnector(fd, resources->connectors[i]);
+		if (!connector) {
+			printf("  can't get connector info %d\n",
+			       resources->connectors[i]);
 			continue;
 		}
 
-		if (mode_conn->connection != DRM_MODE_CONNECTED) {
-			printf("Connector %d not connector, skipping...\n", i);
+		printf("  connector type: %d\n", connector->connector_type);
+
+		if (connector->connection != DRM_MODE_CONNECTED) {
+			printf("  not connected, skipping...\n");
+			drmModeFreeConnector(connector);
 			continue;
 		}
 
-		if (mode_conn->encoder_id) {
-			printf("There's a connected encoder already (id %d)\n",
-				mode_conn->encoder_id);
-			mode_enc = drmModeGetEncoder(fd, mode_conn->encoder_id);
-		} else {
-			mode_enc = NULL;
+		if (connector->count_modes == 0) {
+			printf("  this connector doesn't have any valid modes\n");
+			continue;
 		}
 
-		if (mode_enc) {
-			if (mode_enc->crtc_id) {
-				printf("The encoder is connected to the CRTC %d\n",
-					mode_enc->crtc_id);
-			}
-			drmModeFreeEncoder(mode_enc);
+		drmModeModeInfo *mode_info = &connector->modes[i];
+		printf("    Mode %d\n", i);
+		printf("      clock: %d\n", mode_info->clock);
+		printf("      hdisplay: %d\n", mode_info->hdisplay);
+		printf("      vdisplay: %d\n", mode_info->vdisplay);
+		printf("      vrefresh: %d\n", mode_info->vrefresh);
+		printf("      flags: 0x%08X\n", mode_info->flags);
+		printf("      type: 0x%08X\n", mode_info->type);
+		printf("      name: %s\n", mode_info->name);
+
+		if (setup_device(device, resources, connector) < 0) {
+			drmModeFreeConnector(connector);
+			continue;
 		}
 
-		/*printf("  Connected: %d\n", (mode_conn->connection == DRM_MODE_CONNECTED));
-		printf("  Count modes: %d\n", mode_conn->count_modes);
+		device->connector = connector->connector_id;
+		device->width = connector->modes[0].hdisplay;
+		device->height = connector->modes[0].vdisplay;
 
-		for (j = 0; j < mode_conn->count_modes; j++) {
-			drmModeModeInfo *mode_info = &mode_conn->modes[j];
+		drmModeFreeConnector(connector);
+		drmModeFreeResources(resources);
 
-			printf("    Mode %d\n", j);
-			printf("      clock: %d\n", mode_info->clock);
-			printf("      hdisplay: %d\n", mode_info->hdisplay);
-			printf("      vdisplay: %d\n", mode_info->vdisplay);
-			printf("      vrefresh: %d\n", mode_info->vrefresh);
-			printf("      flags: 0x%08X\n", mode_info->flags);
-			printf("      type: 0x%08X\n", mode_info->type);
-			printf("      name: %s\n", mode_info->name);
-
-		}*/
-
-		drmModeFreeConnector(mode_conn);
-
+		return 0;
 	}
 
-	drmModeFreeResources(mode_res);
-
+	drmModeFreeResources(resources);
 	close(fd);
+
+	return -1;
+}
+
+int at_device_close(struct at_device *device)
+{
+	close(device->fd);
+	return 0;
+}
+
+struct at_dumb_buffer *
+at_dumb_buffer_create(struct at_device *device, uint16_t width,
+		      uint16_t height)
+{
+	int ret;
+	struct at_dumb_buffer *dumb;
+	struct drm_mode_create_dumb create_dumb;
+	struct drm_mode_destroy_dumb destroy_dumb;
+	struct drm_mode_map_dumb map_dumb;
+
+	dumb = malloc(sizeof(*dumb));
+	if (!dumb)
+		return NULL;
+
+	dumb->width = width;
+	dumb->height = height;
+
+	memset(&create_dumb, 0, sizeof(create_dumb));
+	create_dumb.width = width;
+	create_dumb.height = height;
+	create_dumb.bpp = 32;
+
+	ret = drmIoctl(device->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_dumb);
+	if (ret < 0)
+		goto err_create;
+
+	dumb->handle = create_dumb.handle;
+	dumb->pitch = create_dumb.pitch;
+	dumb->size = create_dumb.size;
+
+	ret = drmModeAddFB(device->fd, width, height, 24, 32, dumb->pitch,
+			   dumb->handle, &dumb->fb);
+	if (ret)
+		goto err_add;
+
+	memset(&map_dumb, 0, sizeof(map_dumb));
+	map_dumb.handle = dumb->handle;
+
+	ret = drmIoctl(device->fd, DRM_IOCTL_MODE_MAP_DUMB, &map_dumb);
+	if (ret < 0)
+		goto err_map;
+
+	dumb->data = mmap(NULL, dumb->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			  device->fd, map_dumb.offset);
+
+	if (dumb->data == MAP_FAILED)
+		goto err_map;
+
+	memset(dumb->data, 0, dumb->size);
+
+	return dumb;
+
+err_map:
+	drmModeRmFB(device->fd, dumb->fb);
+err_add:
+	memset(&destroy_dumb, 0, sizeof(destroy_dumb));
+	destroy_dumb.handle = create_dumb.handle;
+	drmIoctl(device->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
+err_create:
+	free(dumb);
+
+	return NULL;
+}
+
+void at_dumb_buffer_free(struct at_device *device, struct at_dumb_buffer *dumb)
+{
+	struct drm_mode_destroy_dumb destroy_dumb;
+
+	munmap(dumb->data, dumb->size);
+
+	drmModeRmFB(device->fd, dumb->fb);
+
+	memset(&destroy_dumb, 0, sizeof(destroy_dumb));
+	destroy_dumb.handle = dumb->handle;
+	drmIoctl(device->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
+
+	free(dumb);
+}
+
+int main(int argc, char *argv[])
+{
+	struct at_device dev;
+	struct at_dumb_buffer *dumb;
+
+	printf("Hello from " PACKAGE_NAME ".\n");
+
+	if (at_device_open(&dev, "/dev/dri/card0") < 0) {
+		fprintf(stderr, "Couldn't initialize card0\n");
+		return -1;
+	}
+
+	printf("Size: (%d, %d)\n", dev.width, dev.height);
+
+	dumb = at_dumb_buffer_create(&dev, 128, 128);
+	if (!dumb) {
+		fprintf(stderr, "Couldn't create dumb buffer\n");
+		at_device_close(&dev);
+		return -1;
+	}
+
+	at_dumb_buffer_free(&dev, dumb);
+
+	at_device_close(&dev);
 
 	return 0;
 }
