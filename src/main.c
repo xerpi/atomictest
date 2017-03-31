@@ -302,9 +302,29 @@ int at_device_modeset_restore(struct at_device *device)
 	device->saved_crtc = NULL;
 }
 
+static void draw_frame(struct at_dumb_buffer *dumb)
+{
+	static const uint32_t colors[] = {
+		0xFF0000, 0x00FF00, 0x0000FF
+	};
+
+	static int cur = 0;
+	int i, j;
+
+	for (i = 0; i < dumb->height; i++) {
+		uint32_t *pixel = (uint32_t *)(dumb->data + i * dumb->pitch);
+		for (j = 0; j < dumb->width; j++) {
+			pixel[j] = colors[cur];
+		}
+	}
+
+	cur = (cur + 1) % (sizeof(colors) / sizeof(*colors));
+}
+
 int main(int argc, char *argv[])
 {
 	int i, j;
+	int cur_fb;
 	struct at_device dev;
 	struct at_dumb_buffer *dumbs[NUM_FBS] = { 0 };
 
@@ -327,20 +347,14 @@ int main(int argc, char *argv[])
 
 	at_device_modeset_apply(&dev, dumbs[0]);
 
-	for (i = 0; i < dumbs[0]->height; i++) {
-		uint32_t *pixel_0 = (uint32_t *)(dumbs[0]->data + i * dumbs[0]->pitch);
-		uint32_t *pixel_1 = (uint32_t *)(dumbs[1]->data + i * dumbs[1]->pitch);
-		for (j = 0; j < dumbs[0]->width; j++) {
-			pixel_0[j] = 0xFF0000;
-			pixel_1[j] = 0x00FF00;
-		}
-	}
-
-	int buff = 1;
+	cur_fb = 0;
 	while (run) {
-		usleep((1000 * 1000) / 60);
-		at_device_modeset_crtc(&dev, dumbs[buff]);
-		buff ^= 1;
+		draw_frame(dumbs[cur_fb]);
+
+		usleep((1000 * 1000) / 5);
+
+		cur_fb ^= 1;
+		at_device_modeset_crtc(&dev, dumbs[cur_fb]);
 	}
 
 	at_device_modeset_restore(&dev);
