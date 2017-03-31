@@ -283,16 +283,14 @@ int at_device_modeset_crtc(struct at_device *device, struct at_dumb_buffer *dumb
 			      &device->connector, 1, &device->mode);
 }
 
-int at_device_modeset_apply(struct at_device *device, struct at_dumb_buffer *dumb)
-{
-	device->saved_crtc = drmModeGetCrtc(device->fd, device->crtc);
-
-	return at_device_modeset_crtc(device, dumb);
-}
-
 int at_device_modeset_restore(struct at_device *device)
 {
-	drmModeSetCrtc(device->fd, device->saved_crtc->crtc_id,
+	int ret;
+
+	if (!device->saved_crtc)
+		return -1;
+
+	ret = drmModeSetCrtc(device->fd, device->saved_crtc->crtc_id,
 		       device->saved_crtc->buffer_id, device->saved_crtc->x,
 		       device->saved_crtc->y, &device->connector, 1,
 		       &device->saved_crtc->mode);
@@ -300,6 +298,34 @@ int at_device_modeset_restore(struct at_device *device)
 	drmModeFreeCrtc(device->saved_crtc);
 
 	device->saved_crtc = NULL;
+
+	return ret;
+}
+
+int at_device_modeset_backup(struct at_device *device)
+{
+	int ret;
+
+	if (device->saved_crtc) {
+		ret = at_device_modeset_restore(device);
+		if (ret < 0)
+			return ret;
+	}
+
+	device->saved_crtc = drmModeGetCrtc(device->fd, device->crtc);
+
+	return 0;
+}
+
+static void fill_dumb(struct at_dumb_buffer *dumb, uint32_t color)
+{
+	int i, j;
+
+	for (i = 0; i < dumb->height; i++) {
+		uint32_t *pixel = (uint32_t *)(dumb->data + i * dumb->pitch);
+		for (j = 0; j < dumb->width; j++)
+			pixel[j] = color;
+	}
 }
 
 static void draw_frame(struct at_dumb_buffer *dumb)
@@ -309,14 +335,8 @@ static void draw_frame(struct at_dumb_buffer *dumb)
 	};
 
 	static int cur = 0;
-	int i, j;
 
-	for (i = 0; i < dumb->height; i++) {
-		uint32_t *pixel = (uint32_t *)(dumb->data + i * dumb->pitch);
-		for (j = 0; j < dumb->width; j++) {
-			pixel[j] = colors[cur];
-		}
-	}
+	fill_dumb(dumb, colors[cur]);
 
 	cur = (cur + 1) % (sizeof(colors) / sizeof(*colors));
 }
@@ -333,28 +353,33 @@ int main(int argc, char *argv[])
 	printf("Hello from " PACKAGE_NAME ".\n");
 
 	if (at_device_open(&dev, "/dev/dri/card0") < 0) {
-		fprintf(stderr, "Couldn't initialize card0\n");
+		fprintf(stderr, "Couldn't initialize card0.\n");
 		return -1;
 	}
 
 	for (i = 0; i < NUM_FBS; i++) {
 		dumbs[i] = at_dumb_buffer_create(&dev, dev.width, dev.height);
 		if (!dumbs[i]) {
-			fprintf(stderr, "Couldn't create dumb buffer\n");
+			fprintf(stderr, "Couldn't create dumb buffer.\n");
 			goto err_dumb_create;
 		}
 	}
 
-	at_device_modeset_apply(&dev, dumbs[0]);
+	at_device_modeset_backup(&dev);
 
 	cur_fb = 0;
 	while (run) {
+		fill_dumb(dumbs[cur_fb], 0);
+
 		draw_frame(dumbs[cur_fb]);
 
 		usleep((1000 * 1000) / 5);
 
+		if (at_device_modeset_crtc(&dev, dumbs[cur_fb]) < 0) {
+			fprintf(stderr, "Couldn't modeset (SetCrtc).\n");
+			break;
+		}
 		cur_fb ^= 1;
-		at_device_modeset_crtc(&dev, dumbs[cur_fb]);
 	}
 
 	at_device_modeset_restore(&dev);
@@ -365,7 +390,6 @@ int main(int argc, char *argv[])
 	at_device_close(&dev);
 
 	return 0;
-
 
 err_dumb_create:
 	for (j = 0; j < i; j++)
