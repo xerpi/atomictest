@@ -2,22 +2,29 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <signal.h>
 #include <config.h>
+
+#define NUM_FBS 2
 
 struct at_device {
 	int fd;
 
+	drmModeModeInfo mode;
 	uint16_t width;
 	uint16_t height;
 
 	uint32_t connector;
 	uint32_t crtc;
+
+	drmModeCrtc *saved_crtc;
 };
 
 struct at_dumb_buffer {
@@ -32,6 +39,13 @@ struct at_dumb_buffer {
 
 	uint8_t *data;
 };
+
+static bool run = true;
+
+static void sigint_handler(int sig)
+{
+	run = false;
+}
 
 static int setup_device(struct at_device *device, drmModeRes *resources,
 			drmModeConnector *connector)
@@ -160,9 +174,11 @@ int at_device_open(struct at_device *device, const char *node)
 			continue;
 		}
 
-		device->connector = connector->connector_id;
+		memcpy(&device->mode, &connector->modes[0], sizeof(device->mode));
 		device->width = connector->modes[0].hdisplay;
 		device->height = connector->modes[0].vdisplay;
+		device->connector = connector->connector_id;
+		device->saved_crtc = NULL;
 
 		drmModeFreeConnector(connector);
 		drmModeFreeResources(resources);
@@ -261,10 +277,38 @@ void at_dumb_buffer_free(struct at_device *device, struct at_dumb_buffer *dumb)
 	free(dumb);
 }
 
+int at_device_modeset_crtc(struct at_device *device, struct at_dumb_buffer *dumb)
+{
+	return drmModeSetCrtc(device->fd, device->crtc, dumb->fb, 0, 0,
+			      &device->connector, 1, &device->mode);
+}
+
+int at_device_modeset_apply(struct at_device *device, struct at_dumb_buffer *dumb)
+{
+	device->saved_crtc = drmModeGetCrtc(device->fd, device->crtc);
+
+	return at_device_modeset_crtc(device, dumb);
+}
+
+int at_device_modeset_restore(struct at_device *device)
+{
+	drmModeSetCrtc(device->fd, device->saved_crtc->crtc_id,
+		       device->saved_crtc->buffer_id, device->saved_crtc->x,
+		       device->saved_crtc->y, &device->connector, 1,
+		       &device->saved_crtc->mode);
+
+	drmModeFreeCrtc(device->saved_crtc);
+
+	device->saved_crtc = NULL;
+}
+
 int main(int argc, char *argv[])
 {
+	int i, j;
 	struct at_device dev;
-	struct at_dumb_buffer *dumb;
+	struct at_dumb_buffer *dumbs[NUM_FBS] = { 0 };
+
+	signal(SIGINT, sigint_handler);
 
 	printf("Hello from " PACKAGE_NAME ".\n");
 
@@ -273,18 +317,47 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	printf("Size: (%d, %d)\n", dev.width, dev.height);
-
-	dumb = at_dumb_buffer_create(&dev, 128, 128);
-	if (!dumb) {
-		fprintf(stderr, "Couldn't create dumb buffer\n");
-		at_device_close(&dev);
-		return -1;
+	for (i = 0; i < NUM_FBS; i++) {
+		dumbs[i] = at_dumb_buffer_create(&dev, dev.width, dev.height);
+		if (!dumbs[i]) {
+			fprintf(stderr, "Couldn't create dumb buffer\n");
+			goto err_dumb_create;
+		}
 	}
 
-	at_dumb_buffer_free(&dev, dumb);
+	at_device_modeset_apply(&dev, dumbs[0]);
+
+	for (i = 0; i < dumbs[0]->height; i++) {
+		uint32_t *pixel_0 = (uint32_t *)(dumbs[0]->data + i * dumbs[0]->pitch);
+		uint32_t *pixel_1 = (uint32_t *)(dumbs[1]->data + i * dumbs[1]->pitch);
+		for (j = 0; j < dumbs[0]->width; j++) {
+			pixel_0[j] = 0xFF0000;
+			pixel_1[j] = 0x00FF00;
+		}
+	}
+
+	int buff = 1;
+	while (run) {
+		usleep((1000 * 1000) / 60);
+		at_device_modeset_crtc(&dev, dumbs[buff]);
+		buff ^= 1;
+	}
+
+	at_device_modeset_restore(&dev);
+
+	for (i = 0; i < NUM_FBS; i++)
+		at_dumb_buffer_free(&dev, dumbs[i]);
 
 	at_device_close(&dev);
 
 	return 0;
+
+
+err_dumb_create:
+	for (j = 0; j < i; j++)
+		at_dumb_buffer_free(&dev, dumbs[j]);
+
+	at_device_close(&dev);
+
+	return -1;
 }
