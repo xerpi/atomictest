@@ -6,13 +6,14 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <signal.h>
 #include <config.h>
 
-#define NUM_FBS 2
+#define ATOMICTEST_NUM_FBS 2
 
 struct at_device {
 	int fd;
@@ -38,6 +39,15 @@ struct at_dumb_buffer {
 	uint32_t fb;
 
 	uint8_t *data;
+};
+
+struct at_instance {
+	struct at_device device;
+	struct at_dumb_buffer *fbs[ATOMICTEST_NUM_FBS];
+
+	uint32_t cur_fb;
+	bool run;
+	bool flip_pending;
 };
 
 static bool run = true;
@@ -283,17 +293,19 @@ int at_device_modeset_crtc(struct at_device *device, struct at_dumb_buffer *dumb
 			      &device->connector, 1, &device->mode);
 }
 
-int at_device_modeset_restore(struct at_device *device)
+int at_device_modeset_restore(struct at_device *device, bool set_crtc)
 {
-	int ret;
+	int ret = 0;
 
 	if (!device->saved_crtc)
 		return -1;
 
-	ret = drmModeSetCrtc(device->fd, device->saved_crtc->crtc_id,
-		       device->saved_crtc->buffer_id, device->saved_crtc->x,
-		       device->saved_crtc->y, &device->connector, 1,
-		       &device->saved_crtc->mode);
+	if (set_crtc)
+		ret = drmModeSetCrtc(device->fd, device->saved_crtc->crtc_id,
+				     device->saved_crtc->buffer_id,
+				     device->saved_crtc->x, device->saved_crtc->y,
+				     &device->connector, 1,
+				     &device->saved_crtc->mode);
 
 	drmModeFreeCrtc(device->saved_crtc);
 
@@ -307,7 +319,7 @@ int at_device_modeset_backup(struct at_device *device)
 	int ret;
 
 	if (device->saved_crtc) {
-		ret = at_device_modeset_restore(device);
+		ret = at_device_modeset_restore(device, true);
 		if (ret < 0)
 			return ret;
 	}
@@ -315,6 +327,115 @@ int at_device_modeset_backup(struct at_device *device)
 	device->saved_crtc = drmModeGetCrtc(device->fd, device->crtc);
 
 	return 0;
+}
+
+struct at_instance *
+at_instance_create(const char *node)
+{
+	int i, j;
+	struct at_instance *instance;
+
+	instance = malloc(sizeof(*instance));
+	if (!instance)
+		return NULL;
+
+	memset(instance, 0, sizeof(*instance));
+
+	if (at_device_open(&instance->device, node) < 0) {
+		fprintf(stderr, "Couldn't initialize %s.\n", node);
+		goto err_open;
+	}
+
+	for (i = 0; i < ATOMICTEST_NUM_FBS; i++) {
+		instance->fbs[i] = at_dumb_buffer_create(&instance->device,
+							 instance->device.width,
+							 instance->device.height);
+		if (!instance->fbs[i]) {
+			fprintf(stderr, "Couldn't create dumb buffer.\n");
+			goto err_dumb_create;
+		}
+	}
+
+	instance->cur_fb = 0;
+	instance->run = true;
+	instance->flip_pending = false;
+
+	return instance;
+
+err_dumb_create:
+	for (j = 0; j < i; j++)
+		at_dumb_buffer_free(&instance->device, instance->fbs[j]);
+
+	at_device_close(&instance->device);
+err_open:
+	free(instance);
+
+	return NULL;
+}
+
+int at_instance_destroy(struct at_instance *instance)
+{
+	int i;
+
+	for (i = 0; i < ATOMICTEST_NUM_FBS; i++)
+		at_dumb_buffer_free(&instance->device, instance->fbs[i]);
+
+	at_device_close(&instance->device);
+}
+
+static void at_page_flip_handler(int fd, unsigned int sequence,
+				 unsigned int tv_sec, unsigned int tv_usec,
+				 void *user_data);
+
+int at_instance_process_events(struct at_instance *instance)
+{
+	int ret;
+	drmEventContext evctx;
+	struct pollfd pfd;
+
+	memset(&evctx, 0, sizeof(evctx));
+	evctx.version = DRM_EVENT_CONTEXT_VERSION;
+	evctx.page_flip_handler = at_page_flip_handler;
+
+	pfd.fd = instance->device.fd;
+	pfd.events = POLLIN;
+
+	ret = poll(&pfd, 1, -1);
+	if (ret < 0)
+		return ret;
+
+	if (pfd.revents & POLLIN) {
+		ret = drmHandleEvent(instance->device.fd, &evctx);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+int at_instance_stop(struct at_instance *instance)
+{
+	instance->run = false;
+	while (instance->flip_pending) {
+		if (at_instance_process_events(instance) < 0)
+			break;
+	}
+}
+
+int at_instance_modeset_apply(struct at_instance *instance)
+{
+	return at_device_modeset_crtc(&instance->device,
+				      instance->fbs[instance->cur_fb]);
+}
+
+int at_instance_modeset_backup(struct at_instance *instance)
+{
+	return at_device_modeset_backup(&instance->device);
+}
+
+int at_instance_modeset_restore(struct at_instance *instance, bool set_crtc)
+{
+	return at_device_modeset_restore(&instance->device, set_crtc);
 }
 
 static void fill_dumb(struct at_dumb_buffer *dumb, uint32_t color)
@@ -328,74 +449,76 @@ static void fill_dumb(struct at_dumb_buffer *dumb, uint32_t color)
 	}
 }
 
-static void draw_frame(struct at_dumb_buffer *dumb)
+static void at_draw_frame(struct at_instance *instance)
 {
 	static const uint32_t colors[] = {
 		0xFF0000, 0x00FF00, 0x0000FF
 	};
 
-	static int cur = 0;
+	static int c = 0;
+	int ret;
+	uint32_t next_fb = (instance->cur_fb + 1) % ATOMICTEST_NUM_FBS;
 
-	fill_dumb(dumb, colors[cur]);
+	fill_dumb(instance->fbs[next_fb], colors[c]);
 
-	cur = (cur + 1) % (sizeof(colors) / sizeof(*colors));
+	c = (c + 1) % (sizeof(colors) / sizeof(*colors));
+
+	ret = drmModePageFlip(instance->device.fd, instance->device.crtc,
+			instance->fbs[next_fb]->fb,
+			DRM_MODE_PAGE_FLIP_EVENT, instance);
+	if (!ret) {
+		instance->cur_fb = next_fb;
+		instance->flip_pending = true;
+	}
+}
+
+static void at_page_flip_handler(int fd, unsigned int sequence,
+				 unsigned int tv_sec, unsigned int tv_usec,
+				 void *user_data)
+{
+	struct at_instance *instance = user_data;
+
+	instance->flip_pending = false;
+
+	if (instance->run)
+		at_draw_frame(instance);
 }
 
 int main(int argc, char *argv[])
 {
-	int i, j;
-	int cur_fb;
-	struct at_device dev;
-	struct at_dumb_buffer *dumbs[NUM_FBS] = { 0 };
+	struct at_instance *instance;
 
 	signal(SIGINT, sigint_handler);
 
 	printf("Hello from " PACKAGE_NAME ".\n");
 
-	if (at_device_open(&dev, "/dev/dri/card0") < 0) {
-		fprintf(stderr, "Couldn't initialize card0.\n");
+	instance = at_instance_create("/dev/dri/card0");
+	if (!instance)
 		return -1;
-	}
 
-	for (i = 0; i < NUM_FBS; i++) {
-		dumbs[i] = at_dumb_buffer_create(&dev, dev.width, dev.height);
-		if (!dumbs[i]) {
-			fprintf(stderr, "Couldn't create dumb buffer.\n");
-			goto err_dumb_create;
-		}
-	}
+	if (at_instance_modeset_backup(instance) < 0)
+		goto err_modeset_backup;
 
-	at_device_modeset_backup(&dev);
+	if (at_instance_modeset_apply(instance) < 0)
+		goto err_modeset_apply;
 
-	cur_fb = 0;
+	at_draw_frame(instance);
+
 	while (run) {
-		fill_dumb(dumbs[cur_fb], 0);
-
-		draw_frame(dumbs[cur_fb]);
-
-		usleep((1000 * 1000) / 5);
-
-		if (at_device_modeset_crtc(&dev, dumbs[cur_fb]) < 0) {
-			fprintf(stderr, "Couldn't modeset (SetCrtc).\n");
+		if (at_instance_process_events(instance) < 0)
 			break;
-		}
-		cur_fb ^= 1;
 	}
 
-	at_device_modeset_restore(&dev);
-
-	for (i = 0; i < NUM_FBS; i++)
-		at_dumb_buffer_free(&dev, dumbs[i]);
-
-	at_device_close(&dev);
+	at_instance_stop(instance);
+	at_instance_modeset_restore(instance, true);
+	at_instance_destroy(instance);
 
 	return 0;
 
-err_dumb_create:
-	for (j = 0; j < i; j++)
-		at_dumb_buffer_free(&dev, dumbs[j]);
-
-	at_device_close(&dev);
+err_modeset_apply:
+	at_instance_modeset_restore(instance, false);
+err_modeset_backup:
+	at_instance_destroy(instance);
 
 	return -1;
 }
