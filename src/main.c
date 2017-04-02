@@ -113,6 +113,7 @@ int at_device_open(struct at_device *device, const char *node)
 	int ret;
 	uint64_t cap_dumb;
 	drmModeRes *resources;
+	drmModePlaneRes *plane_res;
 
 	fd = open(node, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
@@ -122,24 +123,36 @@ int at_device_open(struct at_device *device, const char *node)
 
 	ret = drmGetCap(fd, DRM_CAP_DUMB_BUFFER, &cap_dumb);
 	if (ret < 0 || !cap_dumb) {
-		fprintf(stderr, "drm: device doesn't support dumb buffers\n");
+		fprintf(stderr, "Error: device doesn't support dumb buffers.\n");
 		close(fd);
 		return -1;
 	}
 
 	resources = drmModeGetResources(fd);
 	if (!resources) {
-		fprintf(stderr, "drm: can't get mode resources\n");
+		fprintf(stderr, "Error: can't get mode resources.\n");
 		close(fd);
 		return -1;
 	}
 
 	device->fd = fd;
 
+	ret = drmSetClientCap(device->fd, DRM_CLIENT_CAP_ATOMIC, 1);
+	if (ret < 0) {
+		fprintf(stderr, "Error: the device doesn't support atomic.\n");
+		drmModeFreeResources(resources);
+		close(fd);
+		return -1;
+	}
+
 	printf("Device fbs: %d\n", resources->count_fbs);
 	printf("Device crtcs: %d\n", resources->count_crtcs);
 	printf("Device encoders: %d\n", resources->count_encoders);
 	printf("Device connectors: %d\n", resources->count_connectors);
+
+	plane_res = drmModeGetPlaneResources(device->fd);
+	printf("Device planes: %d\n", plane_res->count_planes);
+	drmModeFreePlaneResources(plane_res);
 
 	/*
 	 * Get the first connected connector.
@@ -424,8 +437,12 @@ int at_instance_stop(struct at_instance *instance)
 
 int at_instance_modeset_apply(struct at_instance *instance)
 {
-	return at_device_modeset_crtc(&instance->device,
-				      instance->fbs[instance->cur_fb]);
+	int ret = at_device_modeset_crtc(&instance->device,
+					 instance->fbs[instance->cur_fb]);
+	if (ret < 0)
+		fprintf(stderr, "Error setting CRTC.\n");
+
+	return ret;
 }
 
 int at_instance_modeset_backup(struct at_instance *instance)
