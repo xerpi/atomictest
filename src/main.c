@@ -7,10 +7,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
-#include <signal.h>
+#include <libudev.h>
+#include <libinput.h>
 #include <config.h>
 
 #define ATOMICTEST_NUM_FBS 2
@@ -48,17 +50,21 @@ struct at_instance {
 	uint32_t cur_fb;
 	bool run;
 	bool flip_pending;
+
+	struct libinput *li;
 };
 
 static bool run = true;
 
-static void sigint_handler(int sig)
+static void
+sigint_handler(int sig)
 {
 	run = false;
 }
 
-static int setup_device(struct at_device *device, drmModeRes *resources,
-			drmModeConnector *connector)
+static int
+setup_device(struct at_device *device, drmModeRes *resources,
+	     drmModeConnector *connector)
 {
 	int i;
 	drmModeEncoder *encoder;
@@ -106,7 +112,8 @@ static int setup_device(struct at_device *device, drmModeRes *resources,
 	return -1;
 }
 
-int at_device_open(struct at_device *device, const char *node)
+int
+at_device_open(struct at_device *device, const char *node)
 {
 	int i;
 	int fd;
@@ -215,7 +222,8 @@ int at_device_open(struct at_device *device, const char *node)
 	return -1;
 }
 
-int at_device_close(struct at_device *device)
+int
+at_device_close(struct at_device *device)
 {
 	close(device->fd);
 	return 0;
@@ -285,7 +293,8 @@ err_create:
 	return NULL;
 }
 
-void at_dumb_buffer_free(struct at_device *device, struct at_dumb_buffer *dumb)
+void
+at_dumb_buffer_free(struct at_device *device, struct at_dumb_buffer *dumb)
 {
 	struct drm_mode_destroy_dumb destroy_dumb;
 
@@ -300,13 +309,15 @@ void at_dumb_buffer_free(struct at_device *device, struct at_dumb_buffer *dumb)
 	free(dumb);
 }
 
-int at_device_modeset_crtc(struct at_device *device, struct at_dumb_buffer *dumb)
+int
+at_device_modeset_crtc(struct at_device *device, struct at_dumb_buffer *dumb)
 {
 	return drmModeSetCrtc(device->fd, device->crtc, dumb->fb, 0, 0,
 			      &device->connector, 1, &device->mode);
 }
 
-int at_device_modeset_restore(struct at_device *device, bool set_crtc)
+int
+at_device_modeset_restore(struct at_device *device, bool set_crtc)
 {
 	int ret = 0;
 
@@ -327,7 +338,8 @@ int at_device_modeset_restore(struct at_device *device, bool set_crtc)
 	return ret;
 }
 
-int at_device_modeset_save(struct at_device *device)
+int
+at_device_modeset_save(struct at_device *device)
 {
 	int ret;
 
@@ -340,6 +352,84 @@ int at_device_modeset_save(struct at_device *device)
 	device->saved_crtc = drmModeGetCrtc(device->fd, device->crtc);
 
 	return 0;
+}
+
+static int
+at_libinput_if_open_restricted(const char *path, int flags, void *user_data)
+{
+	return open(path, flags);
+}
+
+static void
+at_libinput_if_close_restricted(int fd, void *user_data)
+{
+	close(fd);
+}
+
+static const struct libinput_interface at_libinput_if = {
+	.open_restricted = at_libinput_if_open_restricted,
+	.close_restricted = at_libinput_if_close_restricted
+};
+
+static int
+at_instance_libinput_handle_events(struct at_instance *instance)
+{
+	struct libinput_event *ev;
+
+	libinput_dispatch(instance->li);
+
+	while ((ev = libinput_get_event(instance->li))) {
+		switch (libinput_event_get_type(ev)) {
+		case LIBINPUT_EVENT_KEYBOARD_KEY:
+			printf("keyboard key event!\n");
+			break;
+		}
+		libinput_event_destroy(ev);
+	}
+
+	return 0;
+}
+
+static int
+at_instance_libinput_init(struct at_instance *instance)
+{
+	struct libinput *li;
+	struct udev *udev = udev_new();
+
+	if (!udev) {
+		fprintf(stderr, "Failed to initialize udev\n");
+		return -1;
+	}
+
+	li = libinput_udev_create_context(&at_libinput_if, instance, udev);
+	if (!li) {
+		fprintf(stderr, "Failed to initialize context from udev\n");
+		goto err_li_udev;
+	}
+
+	if (libinput_udev_assign_seat(li, "seat0")) {
+		fprintf(stderr, "Failed to set seat\n");
+		goto err_li_seat;
+	}
+
+	instance->li = li;
+
+	at_instance_libinput_handle_events(instance);
+
+	udev_unref(udev);
+	return 0;
+
+err_li_seat:
+	libinput_unref(li);
+err_li_udev:
+	udev_unref(udev);
+	return -1;
+}
+
+static int
+at_instance_libinput_close(struct at_instance *instance)
+{
+	return libinput_unref(instance->li) == NULL;
 }
 
 struct at_instance *
@@ -365,9 +455,12 @@ at_instance_create(const char *node)
 							 instance->device.height);
 		if (!instance->fbs[i]) {
 			fprintf(stderr, "Couldn't create dumb buffer.\n");
-			goto err_dumb_create;
+			goto err_free_fbs;
 		}
 	}
+
+	if (at_instance_libinput_init(instance) < 0)
+		goto err_free_fbs;
 
 	instance->cur_fb = 0;
 	instance->run = true;
@@ -375,7 +468,7 @@ at_instance_create(const char *node)
 
 	return instance;
 
-err_dumb_create:
+err_free_fbs:
 	for (j = 0; j < i; j++)
 		at_dumb_buffer_free(&instance->device, instance->fbs[j]);
 
@@ -386,9 +479,12 @@ err_open:
 	return NULL;
 }
 
-int at_instance_destroy(struct at_instance *instance)
+int
+at_instance_destroy(struct at_instance *instance)
 {
 	int i;
+
+	at_instance_libinput_close(instance);
 
 	for (i = 0; i < ATOMICTEST_NUM_FBS; i++)
 		at_dumb_buffer_free(&instance->device, instance->fbs[i]);
@@ -396,37 +492,46 @@ int at_instance_destroy(struct at_instance *instance)
 	at_device_close(&instance->device);
 }
 
-static void at_page_flip_handler(int fd, unsigned int sequence,
-				 unsigned int tv_sec, unsigned int tv_usec,
-				 void *user_data);
+static void
+at_page_flip_handler(int fd, unsigned int sequence, unsigned int tv_sec,
+		     unsigned int tv_usec, void *user_data);
 
-int at_instance_process_events(struct at_instance *instance)
+int
+at_instance_process_events(struct at_instance *instance)
 {
 	int ret;
 	drmEventContext evctx;
-	struct pollfd pfd;
+	struct pollfd pfds[2];
 
 	memset(&evctx, 0, sizeof(evctx));
 	evctx.version = DRM_EVENT_CONTEXT_VERSION;
 	evctx.page_flip_handler = at_page_flip_handler;
 
-	pfd.fd = instance->device.fd;
-	pfd.events = POLLIN;
+	memset(pfds, 0, sizeof(pfds));
+	pfds[0].fd = instance->device.fd;
+	pfds[0].events = POLLIN;
 
-	ret = poll(&pfd, 1, -1);
+	pfds[1].fd = libinput_get_fd(instance->li);
+	pfds[1].events = POLLIN;
+
+	ret = poll(pfds, 2, -1);
 	if (ret < 0)
 		return ret;
 
-	if (pfd.revents & POLLIN) {
+	if (pfds[0].revents & POLLIN) {
 		ret = drmHandleEvent(instance->device.fd, &evctx);
 		if (ret < 0)
 			return ret;
 	}
 
+	if (pfds[1].revents & POLLIN)
+		at_instance_libinput_handle_events(instance);
+
 	return 0;
 }
 
-int at_instance_stop(struct at_instance *instance)
+int
+at_instance_stop(struct at_instance *instance)
 {
 	instance->run = false;
 	while (instance->flip_pending) {
@@ -435,7 +540,8 @@ int at_instance_stop(struct at_instance *instance)
 	}
 }
 
-int at_instance_modeset_apply(struct at_instance *instance)
+int
+at_instance_modeset_apply(struct at_instance *instance)
 {
 	int ret = at_device_modeset_crtc(&instance->device,
 					 instance->fbs[instance->cur_fb]);
@@ -445,17 +551,20 @@ int at_instance_modeset_apply(struct at_instance *instance)
 	return ret;
 }
 
-int at_instance_modeset_save(struct at_instance *instance)
+int
+at_instance_modeset_save(struct at_instance *instance)
 {
 	return at_device_modeset_save(&instance->device);
 }
 
-int at_instance_modeset_restore(struct at_instance *instance, bool set_crtc)
+int
+at_instance_modeset_restore(struct at_instance *instance, bool set_crtc)
 {
 	return at_device_modeset_restore(&instance->device, set_crtc);
 }
 
-static void fill_dumb(struct at_dumb_buffer *dumb, uint32_t color)
+static void
+fill_dumb(struct at_dumb_buffer *dumb, uint32_t color)
 {
 	int i, j;
 
@@ -466,7 +575,8 @@ static void fill_dumb(struct at_dumb_buffer *dumb, uint32_t color)
 	}
 }
 
-static void at_draw_frame(struct at_instance *instance)
+static void
+at_draw_frame(struct at_instance *instance)
 {
 	static const uint32_t colors[] = {
 		0xFF0000, 0x00FF00, 0x0000FF
@@ -489,9 +599,9 @@ static void at_draw_frame(struct at_instance *instance)
 	}
 }
 
-static void at_page_flip_handler(int fd, unsigned int sequence,
-				 unsigned int tv_sec, unsigned int tv_usec,
-				 void *user_data)
+static void
+at_page_flip_handler(int fd, unsigned int sequence, unsigned int tv_sec,
+		     unsigned int tv_usec, void *user_data)
 {
 	struct at_instance *instance = user_data;
 
@@ -501,7 +611,8 @@ static void at_page_flip_handler(int fd, unsigned int sequence,
 		at_draw_frame(instance);
 }
 
-int main(int argc, char *argv[])
+int
+main(int argc, char *argv[])
 {
 	struct at_instance *instance;
 
