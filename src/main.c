@@ -327,7 +327,7 @@ int at_device_modeset_restore(struct at_device *device, bool set_crtc)
 	return ret;
 }
 
-int at_device_modeset_backup(struct at_device *device)
+int at_device_modeset_save(struct at_device *device)
 {
 	int ret;
 
@@ -445,9 +445,9 @@ int at_instance_modeset_apply(struct at_instance *instance)
 	return ret;
 }
 
-int at_instance_modeset_backup(struct at_instance *instance)
+int at_instance_modeset_save(struct at_instance *instance)
 {
-	return at_device_modeset_backup(&instance->device);
+	return at_device_modeset_save(&instance->device);
 }
 
 int at_instance_modeset_restore(struct at_instance *instance, bool set_crtc)
@@ -513,8 +513,8 @@ int main(int argc, char *argv[])
 	if (!instance)
 		return -1;
 
-	if (at_instance_modeset_backup(instance) < 0)
-		goto err_modeset_backup;
+	if (at_instance_modeset_save(instance) < 0)
+		goto err_modeset_save;
 
 	if (at_instance_modeset_apply(instance) < 0)
 		goto err_modeset_apply;
@@ -534,7 +534,7 @@ int main(int argc, char *argv[])
 
 err_modeset_apply:
 	at_instance_modeset_restore(instance, false);
-err_modeset_backup:
+err_modeset_save:
 	at_instance_destroy(instance);
 
 	return -1;
