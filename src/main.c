@@ -13,6 +13,7 @@
 #include <xf86drmMode.h>
 #include <libudev.h>
 #include <libinput.h>
+#include <linux/input.h>
 #include <config.h>
 
 #define ATOMICTEST_NUM_FBS 2
@@ -52,6 +53,8 @@ struct at_instance {
 	bool flip_pending;
 
 	struct libinput *li;
+
+	uint32_t color;
 };
 
 static bool run = true;
@@ -371,6 +374,21 @@ static const struct libinput_interface at_libinput_if = {
 	.close_restricted = at_libinput_if_close_restricted
 };
 
+static void
+at_instance_li_handle_key_event(struct at_instance *instance, struct libinput_event *ev)
+{
+	struct libinput_event_keyboard *kev =
+		libinput_event_get_keyboard_event(ev);
+	if (!kev)
+		return;
+
+	switch (libinput_event_keyboard_get_key(kev)) {
+	case KEY_Q:
+		run = 0;
+		break;
+	}
+}
+
 static int
 at_instance_libinput_handle_events(struct at_instance *instance)
 {
@@ -381,9 +399,10 @@ at_instance_libinput_handle_events(struct at_instance *instance)
 	while ((ev = libinput_get_event(instance->li))) {
 		switch (libinput_event_get_type(ev)) {
 		case LIBINPUT_EVENT_KEYBOARD_KEY:
-			printf("keyboard key event!\n");
+			at_instance_li_handle_key_event(instance, ev);
 			break;
 		}
+
 		libinput_event_destroy(ev);
 	}
 
