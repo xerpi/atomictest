@@ -48,10 +48,12 @@ struct at_dumb_buffer {
 struct at_instance {
 	struct at_device device;
 	struct at_dumb_buffer *fbs[ATOMICTEST_NUM_FBS];
+	struct at_dumb_buffer *cursor_buf;
 
 	uint32_t cur_fb;
 	bool run;
 	bool flip_pending;
+	bool crtc_changed;
 
 	struct libinput *li;
 
@@ -235,7 +237,7 @@ at_device_close(struct at_device *device)
 
 struct at_dumb_buffer *
 at_dumb_buffer_create(struct at_device *device, uint16_t width,
-		      uint16_t height)
+		      uint16_t height, uint32_t format)
 {
 	int ret;
 	struct at_dumb_buffer *dumb;
@@ -267,7 +269,7 @@ at_dumb_buffer_create(struct at_device *device, uint16_t width,
 	handles[0] = dumb->handle;
 	pitches[0] = dumb->pitch;
 	offsets[0] = 0;
-	ret = drmModeAddFB2(device->fd, width, height, DRM_FORMAT_XRGB8888,
+	ret = drmModeAddFB2(device->fd, width, height, format,
 			    handles, pitches, offsets, &dumb->fb_id, 0);
 	if (ret)
 		goto err_add;
@@ -318,21 +320,28 @@ at_dumb_buffer_free(struct at_device *device, struct at_dumb_buffer *dumb)
 }
 
 int
-at_device_modeset_crtc(struct at_device *device, struct at_dumb_buffer *dumb)
+at_device_mode_set_crtc(struct at_device *device, struct at_dumb_buffer *dumb)
 {
 	return drmModeSetCrtc(device->fd, device->crtc, dumb->fb_id, 0, 0,
 			      &device->connector, 1, &device->mode);
 }
 
 int
-at_device_modeset_restore(struct at_device *device, bool set_crtc)
+at_device_mode_set_cursor(struct at_device *device, struct at_dumb_buffer *dumb)
+{
+	return drmModeSetCursor(device->fd, device->crtc, dumb->fb_id,
+				dumb->width, dumb->height);
+}
+
+int
+at_device_modeset_restore(struct at_device *device, bool restore_crtc)
 {
 	int ret = 0;
 
 	if (!device->saved_crtc)
 		return -1;
 
-	if (set_crtc)
+	if (restore_crtc)
 		ret = drmModeSetCrtc(device->fd, device->saved_crtc->crtc_id,
 				     device->saved_crtc->buffer_id,
 				     device->saved_crtc->x, device->saved_crtc->y,
@@ -461,6 +470,7 @@ at_instance_create(const char *node)
 {
 	int i, j;
 	struct at_instance *instance;
+	uint64_t cursor_width, cursor_height;
 
 	instance = malloc(sizeof(*instance));
 	if (!instance)
@@ -473,10 +483,19 @@ at_instance_create(const char *node)
 		goto err_open;
 	}
 
+	drmGetCap(instance->device.fd, DRM_CAP_CURSOR_WIDTH, &cursor_width);
+	drmGetCap(instance->device.fd, DRM_CAP_CURSOR_HEIGHT, &cursor_height);
+
+	instance->cursor_buf = at_dumb_buffer_create(&instance->device, cursor_width, cursor_height,
+						     DRM_FORMAT_ARGB8888);
+	if (!instance->cursor_buf)
+		goto error_cursor_buf_crete;
+
 	for (i = 0; i < ATOMICTEST_NUM_FBS; i++) {
 		instance->fbs[i] = at_dumb_buffer_create(&instance->device,
 							 instance->device.width,
-							 instance->device.height);
+							 instance->device.height,
+							 DRM_FORMAT_XRGB8888);
 		if (!instance->fbs[i]) {
 			fprintf(stderr, "Couldn't create dumb buffer.\n");
 			goto err_free_fbs;
@@ -489,13 +508,15 @@ at_instance_create(const char *node)
 	instance->cur_fb = 0;
 	instance->run = true;
 	instance->flip_pending = false;
+	instance->crtc_changed = false;
 
 	return instance;
 
 err_free_fbs:
+	at_dumb_buffer_free(&instance->device, instance->cursor_buf);
 	for (j = 0; j < i; j++)
 		at_dumb_buffer_free(&instance->device, instance->fbs[j]);
-
+error_cursor_buf_crete:
 	at_device_close(&instance->device);
 err_open:
 	free(instance);
@@ -512,6 +533,8 @@ at_instance_destroy(struct at_instance *instance)
 
 	for (i = 0; i < ATOMICTEST_NUM_FBS; i++)
 		at_dumb_buffer_free(&instance->device, instance->fbs[i]);
+
+	at_dumb_buffer_free(&instance->device, instance->cursor_buf);
 
 	at_device_close(&instance->device);
 }
@@ -567,10 +590,18 @@ at_instance_stop(struct at_instance *instance)
 int
 at_instance_modeset_apply(struct at_instance *instance)
 {
-	int ret = at_device_modeset_crtc(&instance->device,
+	int ret = at_device_mode_set_crtc(&instance->device,
 					 instance->fbs[instance->cur_fb]);
-	if (ret < 0)
+	if (ret < 0) {
 		fprintf(stderr, "Error setting CRTC.\n");
+		return ret;
+	}
+
+	instance->crtc_changed = true;
+
+	ret = at_device_mode_set_cursor(&instance->device, instance->cursor_buf);
+	if (ret < 0)
+		fprintf(stderr, "Error setting the cursor.\n");
 
 	return ret;
 }
@@ -582,9 +613,9 @@ at_instance_modeset_save(struct at_instance *instance)
 }
 
 int
-at_instance_modeset_restore(struct at_instance *instance, bool set_crtc)
+at_instance_modeset_restore(struct at_instance *instance)
 {
-	return at_device_modeset_restore(&instance->device, set_crtc);
+	return at_device_modeset_restore(&instance->device, instance->crtc_changed);
 }
 
 static void
@@ -662,13 +693,13 @@ main(int argc, char *argv[])
 	}
 
 	at_instance_stop(instance);
-	at_instance_modeset_restore(instance, true);
+	at_instance_modeset_restore(instance);
 	at_instance_destroy(instance);
 
 	return 0;
 
 err_modeset_apply:
-	at_instance_modeset_restore(instance, false);
+	at_instance_modeset_restore(instance);
 err_modeset_save:
 	at_instance_destroy(instance);
 
