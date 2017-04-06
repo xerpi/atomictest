@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <drm_fourcc.h>
 #include <libudev.h>
 #include <libinput.h>
 #include <linux/input.h>
@@ -39,7 +40,7 @@ struct at_dumb_buffer {
 	uint32_t pitch;
 	uint64_t size;
 
-	uint32_t fb;
+	uint32_t fb_id;
 
 	uint8_t *data;
 };
@@ -241,6 +242,7 @@ at_dumb_buffer_create(struct at_device *device, uint16_t width,
 	struct drm_mode_create_dumb create_dumb;
 	struct drm_mode_destroy_dumb destroy_dumb;
 	struct drm_mode_map_dumb map_dumb;
+	uint32_t handles[4] = { 0 }, pitches[4] = { 0 }, offsets[4] = { 0 };
 
 	dumb = malloc(sizeof(*dumb));
 	if (!dumb)
@@ -262,8 +264,11 @@ at_dumb_buffer_create(struct at_device *device, uint16_t width,
 	dumb->pitch = create_dumb.pitch;
 	dumb->size = create_dumb.size;
 
-	ret = drmModeAddFB(device->fd, width, height, 24, 32, dumb->pitch,
-			   dumb->handle, &dumb->fb);
+	handles[0] = dumb->handle;
+	pitches[0] = dumb->pitch;
+	offsets[0] = 0;
+	ret = drmModeAddFB2(device->fd, width, height, DRM_FORMAT_XRGB8888,
+			    handles, pitches, offsets, &dumb->fb_id, 0);
 	if (ret)
 		goto err_add;
 
@@ -285,7 +290,7 @@ at_dumb_buffer_create(struct at_device *device, uint16_t width,
 	return dumb;
 
 err_map:
-	drmModeRmFB(device->fd, dumb->fb);
+	drmModeRmFB(device->fd, dumb->fb_id);
 err_add:
 	memset(&destroy_dumb, 0, sizeof(destroy_dumb));
 	destroy_dumb.handle = create_dumb.handle;
@@ -303,7 +308,7 @@ at_dumb_buffer_free(struct at_device *device, struct at_dumb_buffer *dumb)
 
 	munmap(dumb->data, dumb->size);
 
-	drmModeRmFB(device->fd, dumb->fb);
+	drmModeRmFB(device->fd, dumb->fb_id);
 
 	memset(&destroy_dumb, 0, sizeof(destroy_dumb));
 	destroy_dumb.handle = dumb->handle;
@@ -315,7 +320,7 @@ at_dumb_buffer_free(struct at_device *device, struct at_dumb_buffer *dumb)
 int
 at_device_modeset_crtc(struct at_device *device, struct at_dumb_buffer *dumb)
 {
-	return drmModeSetCrtc(device->fd, device->crtc, dumb->fb, 0, 0,
+	return drmModeSetCrtc(device->fd, device->crtc, dumb->fb_id, 0, 0,
 			      &device->connector, 1, &device->mode);
 }
 
@@ -610,7 +615,7 @@ at_draw_frame(struct at_instance *instance)
 	c = (c + 1) % (sizeof(colors) / sizeof(*colors));
 
 	ret = drmModePageFlip(instance->device.fd, instance->device.crtc,
-			instance->fbs[next_fb]->fb,
+			instance->fbs[next_fb]->fb_id,
 			DRM_MODE_PAGE_FLIP_EVENT, instance);
 	if (!ret) {
 		instance->cur_fb = next_fb;
