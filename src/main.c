@@ -59,7 +59,8 @@ struct at_instance {
 
 	struct libinput *li;
 
-	uint32_t color;
+	int cursor_x;
+	int cursor_y;
 };
 
 static bool run = true;
@@ -336,6 +337,12 @@ at_device_mode_set_cursor(struct at_device *device, struct gbm_bo *bo)
 }
 
 int
+at_device_mode_move_cursor(struct at_device *device, int x, int y)
+{
+	return drmModeMoveCursor(device->fd, device->crtc, x, y);
+}
+
+int
 at_device_modeset_restore(struct at_device *device, bool restore_crtc)
 {
 	int ret = 0;
@@ -405,6 +412,35 @@ at_instance_li_handle_key_event(struct at_instance *instance, struct libinput_ev
 	}
 }
 
+static void
+at_instance_li_handle_pointer_motion(struct at_instance *instance, struct libinput_event *ev)
+{
+	double dx, dy;
+	struct libinput_event_pointer *pev =
+		libinput_event_get_pointer_event(ev);
+	if (!pev)
+		return;
+
+	dx = libinput_event_pointer_get_dx(pev);
+	dy = libinput_event_pointer_get_dy(pev);
+
+	instance->cursor_x += dx;
+	instance->cursor_y += dy;
+
+	if (instance->cursor_x > instance->device.width - 1)
+		instance->cursor_x = instance->device.width - 1;
+	else if (instance->cursor_x < 0)
+		instance->cursor_x = 0;
+
+	if (instance->cursor_y > instance->device.height - 1)
+		instance->cursor_y = instance->device.height - 1;
+	else if (instance->cursor_y < 0)
+		instance->cursor_y = 0;
+
+	at_device_mode_move_cursor(&instance->device, instance->cursor_x,
+				   instance->cursor_y);
+}
+
 static int
 at_instance_libinput_handle_events(struct at_instance *instance)
 {
@@ -416,6 +452,9 @@ at_instance_libinput_handle_events(struct at_instance *instance)
 		switch (libinput_event_get_type(ev)) {
 		case LIBINPUT_EVENT_KEYBOARD_KEY:
 			at_instance_li_handle_key_event(instance, ev);
+			break;
+		case LIBINPUT_EVENT_POINTER_MOTION:
+			at_instance_li_handle_pointer_motion(instance, ev);
 			break;
 		}
 
@@ -467,6 +506,27 @@ at_instance_libinput_close(struct at_instance *instance)
 	return libinput_unref(instance->li) == NULL;
 }
 
+static void
+at_gbm_bo_fill(struct gbm_bo *bo, uint32_t color)
+{
+	uint32_t i, j, *data;
+	uint32_t stride = gbm_bo_get_stride(bo);
+	uint32_t width = gbm_bo_get_width(bo);
+	uint32_t height = gbm_bo_get_height(bo);
+
+	data = malloc(stride * height);
+	if (!data)
+		return;
+
+	for (i = 0; i < height; i++)
+		for (j = 0; j < width; j++)
+			data[j + i * stride / 4] = color;
+
+	gbm_bo_write(bo, data, stride * height);
+
+	free(data);
+}
+
 struct at_instance *
 at_instance_create(const char *node)
 {
@@ -502,6 +562,8 @@ at_instance_create(const char *node)
 		goto err_cursor_bo_create;
 	}
 
+	at_gbm_bo_fill(instance->cursor_bo, 0xFFFF0000);
+
 	for (i = 0; i < ATOMICTEST_NUM_FBS; i++) {
 		instance->fbs[i] = at_dumb_buffer_create(&instance->device,
 							 instance->device.width,
@@ -520,6 +582,8 @@ at_instance_create(const char *node)
 	instance->run = true;
 	instance->flip_pending = false;
 	instance->crtc_changed = false;
+	instance->cursor_x = instance->device.width / 2;
+	instance->cursor_y = instance->device.height / 2;
 
 	return instance;
 
@@ -617,6 +681,9 @@ at_instance_modeset_apply(struct at_instance *instance)
 	ret = at_device_mode_set_cursor(&instance->device, instance->cursor_bo);
 	if (ret < 0)
 		fprintf(stderr, "Error setting the cursor.\n");
+
+	ret = at_device_mode_move_cursor(&instance->device, instance->cursor_x,
+					 instance->cursor_y);
 
 	return ret;
 }
