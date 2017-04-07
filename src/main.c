@@ -489,7 +489,7 @@ at_instance_create(const char *node)
 	instance->cursor_buf = at_dumb_buffer_create(&instance->device, cursor_width, cursor_height,
 						     DRM_FORMAT_ARGB8888);
 	if (!instance->cursor_buf)
-		goto error_cursor_buf_crete;
+		goto error_cursor_buf_create;
 
 	for (i = 0; i < ATOMICTEST_NUM_FBS; i++) {
 		instance->fbs[i] = at_dumb_buffer_create(&instance->device,
@@ -516,7 +516,7 @@ err_free_fbs:
 	at_dumb_buffer_free(&instance->device, instance->cursor_buf);
 	for (j = 0; j < i; j++)
 		at_dumb_buffer_free(&instance->device, instance->fbs[j]);
-error_cursor_buf_crete:
+error_cursor_buf_create:
 	at_device_close(&instance->device);
 err_open:
 	free(instance);
@@ -551,7 +551,7 @@ at_instance_process_events(struct at_instance *instance)
 	struct pollfd pfds[2];
 
 	memset(&evctx, 0, sizeof(evctx));
-	evctx.version = DRM_EVENT_CONTEXT_VERSION;
+	evctx.version = 2;
 	evctx.page_flip_handler = at_page_flip_handler;
 
 	memset(pfds, 0, sizeof(pfds));
