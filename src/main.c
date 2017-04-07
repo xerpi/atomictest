@@ -715,17 +715,13 @@ fill_dumb(struct at_dumb_buffer *dumb, uint32_t color)
 static void
 at_draw_frame(struct at_instance *instance)
 {
-	static const uint32_t colors[] = {
-		0xFF0000, 0x00FF00, 0x0000FF
-	};
-
-	static int c = 0;
+	static uint32_t color = 0;
 	int ret;
 	uint32_t next_fb = (instance->cur_fb + 1) % ATOMICTEST_NUM_FBS;
 
-	fill_dumb(instance->fbs[next_fb], colors[c]);
+	fill_dumb(instance->fbs[next_fb], color++);
 
-	c = (c + 1) % (sizeof(colors) / sizeof(*colors));
+	at_gbm_bo_fill(instance->cursor_bo, -color | 0xFF000000);
 
 	ret = drmModePageFlip(instance->device.fd, instance->device.crtc,
 			instance->fbs[next_fb]->fb_id,
