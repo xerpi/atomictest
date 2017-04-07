@@ -12,6 +12,7 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
+#include <gbm.h>
 #include <libudev.h>
 #include <libinput.h>
 #include <linux/input.h>
@@ -47,8 +48,9 @@ struct at_dumb_buffer {
 
 struct at_instance {
 	struct at_device device;
+	struct gbm_device *gbm;
 	struct at_dumb_buffer *fbs[ATOMICTEST_NUM_FBS];
-	struct at_dumb_buffer *cursor_buf;
+	struct gbm_bo *cursor_bo;
 
 	uint32_t cur_fb;
 	bool run;
@@ -327,10 +329,10 @@ at_device_mode_set_crtc(struct at_device *device, struct at_dumb_buffer *dumb)
 }
 
 int
-at_device_mode_set_cursor(struct at_device *device, struct at_dumb_buffer *dumb)
+at_device_mode_set_cursor(struct at_device *device, struct gbm_bo *bo)
 {
-	return drmModeSetCursor(device->fd, device->crtc, dumb->fb_id,
-				dumb->width, dumb->height);
+	return drmModeSetCursor(device->fd, device->crtc, gbm_bo_get_handle(bo).u32,
+				gbm_bo_get_width(bo), gbm_bo_get_height(bo));
 }
 
 int
@@ -483,13 +485,22 @@ at_instance_create(const char *node)
 		goto err_open;
 	}
 
+	instance->gbm = gbm_create_device(instance->device.fd);
+	if (!instance->gbm) {
+		fprintf(stderr, "Couldn't create gbm device.\n");
+		goto err_gbm_create_dev;
+	}
+
 	drmGetCap(instance->device.fd, DRM_CAP_CURSOR_WIDTH, &cursor_width);
 	drmGetCap(instance->device.fd, DRM_CAP_CURSOR_HEIGHT, &cursor_height);
 
-	instance->cursor_buf = at_dumb_buffer_create(&instance->device, cursor_width, cursor_height,
-						     DRM_FORMAT_ARGB8888);
-	if (!instance->cursor_buf)
-		goto error_cursor_buf_create;
+	instance->cursor_bo = gbm_bo_create(instance->gbm, cursor_width, cursor_height,
+					    GBM_FORMAT_ARGB8888,
+					    GBM_BO_USE_CURSOR | GBM_BO_USE_WRITE);
+	if (!instance->cursor_bo) {
+		fprintf(stderr, "Couldn't create the cursor buffer.\n");
+		goto err_cursor_bo_create;
+	}
 
 	for (i = 0; i < ATOMICTEST_NUM_FBS; i++) {
 		instance->fbs[i] = at_dumb_buffer_create(&instance->device,
@@ -513,10 +524,12 @@ at_instance_create(const char *node)
 	return instance;
 
 err_free_fbs:
-	at_dumb_buffer_free(&instance->device, instance->cursor_buf);
 	for (j = 0; j < i; j++)
 		at_dumb_buffer_free(&instance->device, instance->fbs[j]);
-error_cursor_buf_create:
+	gbm_bo_destroy(instance->cursor_bo);
+err_cursor_bo_create:
+	gbm_device_destroy(instance->gbm);
+err_gbm_create_dev:
 	at_device_close(&instance->device);
 err_open:
 	free(instance);
@@ -534,7 +547,9 @@ at_instance_destroy(struct at_instance *instance)
 	for (i = 0; i < ATOMICTEST_NUM_FBS; i++)
 		at_dumb_buffer_free(&instance->device, instance->fbs[i]);
 
-	at_dumb_buffer_free(&instance->device, instance->cursor_buf);
+	gbm_bo_destroy(instance->cursor_bo);
+
+	gbm_device_destroy(instance->gbm);
 
 	at_device_close(&instance->device);
 }
@@ -599,7 +614,7 @@ at_instance_modeset_apply(struct at_instance *instance)
 
 	instance->crtc_changed = true;
 
-	ret = at_device_mode_set_cursor(&instance->device, instance->cursor_buf);
+	ret = at_device_mode_set_cursor(&instance->device, instance->cursor_bo);
 	if (ret < 0)
 		fprintf(stderr, "Error setting the cursor.\n");
 
