@@ -721,7 +721,7 @@ at_draw_frame(struct at_instance *instance)
 
 	fill_dumb(instance->fbs[next_fb], color++);
 
-	at_gbm_bo_fill(instance->cursor_bo, -color | 0xFF000000);
+	at_gbm_bo_fill(instance->cursor_bo, ~color | 0xFF000000);
 
 	ret = drmModePageFlip(instance->device.fd, instance->device.crtc,
 			instance->fbs[next_fb]->fb_id,
