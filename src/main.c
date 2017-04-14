@@ -12,7 +12,6 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
-#include <gbm.h>
 #include <libudev.h>
 #include <libinput.h>
 #include <linux/input.h>
@@ -46,11 +45,15 @@ struct at_dumb_buffer {
 	uint8_t *data;
 };
 
+struct at_dumb_fb {
+	struct at_dumb_buffer *dumb;
+	uint32_t fb_id;
+};
+
 struct at_instance {
 	struct at_device device;
-	struct gbm_device *gbm;
-	struct at_dumb_buffer *fbs[ATOMICTEST_NUM_FBS];
-	struct gbm_bo *cursor_bo;
+	struct at_dumb_fb *fbs[ATOMICTEST_NUM_FBS];
+	struct at_dumb_buffer *cursor_buf;
 
 	uint32_t cur_fb;
 	bool run;
@@ -322,18 +325,70 @@ at_dumb_buffer_free(struct at_device *device, struct at_dumb_buffer *dumb)
 	free(dumb);
 }
 
-int
-at_device_mode_set_crtc(struct at_device *device, struct at_dumb_buffer *dumb)
+static void
+at_dumb_buffer_fill(struct at_dumb_buffer *dumb, uint32_t color)
 {
-	return drmModeSetCrtc(device->fd, device->crtc, dumb->fb_id, 0, 0,
+	int i, j;
+
+	for (i = 0; i < dumb->height; i++) {
+		uint32_t *pixel = (uint32_t *)(dumb->data + i * dumb->pitch);
+		for (j = 0; j < dumb->width; j++)
+			pixel[j] = color;
+	}
+}
+
+struct at_dumb_fb *
+at_dumb_fb_create(struct at_device *device, uint16_t width,
+		      uint16_t height, uint32_t format)
+{
+	int ret;
+	struct at_dumb_fb *fb;
+	uint32_t handles[4] = { 0 }, pitches[4] = { 0 }, offsets[4] = { 0 };
+
+	fb = malloc(sizeof(*fb));
+	if (!fb)
+		return NULL;
+
+	fb->dumb = at_dumb_buffer_create(device, width, height, format);
+	if (!fb->dumb) {
+		free(fb);
+		return NULL;
+	}
+
+	handles[0] = fb->dumb->handle;
+	pitches[0] = fb->dumb->pitch;
+	offsets[0] = 0;
+	ret = drmModeAddFB2(device->fd, width, height, format,
+			    handles, pitches, offsets, &fb->fb_id, 0);
+	if (ret) {
+		at_dumb_buffer_free(device, fb->dumb);
+		free(fb);
+		return NULL;
+	}
+
+	return fb;
+}
+
+void
+at_dumb_fb_free(struct at_device *device, struct at_dumb_fb *fb)
+{
+	drmModeRmFB(device->fd, fb->fb_id);
+	at_dumb_buffer_free(device, fb->dumb);
+	free(fb);
+}
+
+int
+at_device_mode_set_crtc(struct at_device *device, struct at_dumb_fb *fb)
+{
+	return drmModeSetCrtc(device->fd, device->crtc, fb->fb_id, 0, 0,
 			      &device->connector, 1, &device->mode);
 }
 
 int
-at_device_mode_set_cursor(struct at_device *device, struct gbm_bo *bo)
+at_device_mode_set_cursor(struct at_device *device, struct at_dumb_buffer *dumb)
 {
-	return drmModeSetCursor(device->fd, device->crtc, gbm_bo_get_handle(bo).u32,
-				gbm_bo_get_width(bo), gbm_bo_get_height(bo));
+	return drmModeSetCursor(device->fd, device->crtc, dumb->handle,
+				dumb->width, dumb->height);
 }
 
 int
@@ -506,27 +561,6 @@ at_instance_libinput_close(struct at_instance *instance)
 	return libinput_unref(instance->li) == NULL;
 }
 
-static void
-at_gbm_bo_fill(struct gbm_bo *bo, uint32_t color)
-{
-	uint32_t i, j, *data;
-	uint32_t stride = gbm_bo_get_stride(bo);
-	uint32_t width = gbm_bo_get_width(bo);
-	uint32_t height = gbm_bo_get_height(bo);
-
-	data = malloc(stride * height);
-	if (!data)
-		return;
-
-	for (i = 0; i < height; i++)
-		for (j = 0; j < width; j++)
-			data[j + i * stride / 4] = color;
-
-	gbm_bo_write(bo, data, stride * height);
-
-	free(data);
-}
-
 struct at_instance *
 at_instance_create(const char *node)
 {
@@ -545,30 +579,23 @@ at_instance_create(const char *node)
 		goto err_open;
 	}
 
-	instance->gbm = gbm_create_device(instance->device.fd);
-	if (!instance->gbm) {
-		fprintf(stderr, "Couldn't create gbm device.\n");
-		goto err_gbm_create_dev;
-	}
-
 	drmGetCap(instance->device.fd, DRM_CAP_CURSOR_WIDTH, &cursor_width);
 	drmGetCap(instance->device.fd, DRM_CAP_CURSOR_HEIGHT, &cursor_height);
 
-	instance->cursor_bo = gbm_bo_create(instance->gbm, cursor_width, cursor_height,
-					    GBM_FORMAT_ARGB8888,
-					    GBM_BO_USE_CURSOR | GBM_BO_USE_WRITE);
-	if (!instance->cursor_bo) {
+	instance->cursor_buf = at_dumb_buffer_create(&instance->device, cursor_width,
+						     cursor_height, DRM_FORMAT_ARGB8888);
+	if (!instance->cursor_buf) {
 		fprintf(stderr, "Couldn't create the cursor buffer.\n");
-		goto err_cursor_bo_create;
+		goto err_cursor_buf_create;
 	}
 
-	at_gbm_bo_fill(instance->cursor_bo, 0xFFFF0000);
+	at_dumb_buffer_fill(instance->cursor_buf, 0xFFFF0000);
 
 	for (i = 0; i < ATOMICTEST_NUM_FBS; i++) {
-		instance->fbs[i] = at_dumb_buffer_create(&instance->device,
-							 instance->device.width,
-							 instance->device.height,
-							 DRM_FORMAT_XRGB8888);
+		instance->fbs[i] = at_dumb_fb_create(&instance->device,
+						     instance->device.width,
+						     instance->device.height,
+						     DRM_FORMAT_XRGB8888);
 		if (!instance->fbs[i]) {
 			fprintf(stderr, "Couldn't create dumb buffer.\n");
 			goto err_free_fbs;
@@ -589,11 +616,9 @@ at_instance_create(const char *node)
 
 err_free_fbs:
 	for (j = 0; j < i; j++)
-		at_dumb_buffer_free(&instance->device, instance->fbs[j]);
-	gbm_bo_destroy(instance->cursor_bo);
-err_cursor_bo_create:
-	gbm_device_destroy(instance->gbm);
-err_gbm_create_dev:
+		at_dumb_fb_free(&instance->device, instance->fbs[j]);
+	at_dumb_buffer_free(&instance->device, instance->cursor_buf);
+err_cursor_buf_create:
 	at_device_close(&instance->device);
 err_open:
 	free(instance);
@@ -609,11 +634,9 @@ at_instance_destroy(struct at_instance *instance)
 	at_instance_libinput_close(instance);
 
 	for (i = 0; i < ATOMICTEST_NUM_FBS; i++)
-		at_dumb_buffer_free(&instance->device, instance->fbs[i]);
+		at_dumb_fb_free(&instance->device, instance->fbs[i]);
 
-	gbm_bo_destroy(instance->cursor_bo);
-
-	gbm_device_destroy(instance->gbm);
+	at_dumb_buffer_free(&instance->device, instance->cursor_buf);
 
 	at_device_close(&instance->device);
 }
@@ -678,7 +701,7 @@ at_instance_modeset_apply(struct at_instance *instance)
 
 	instance->crtc_changed = true;
 
-	ret = at_device_mode_set_cursor(&instance->device, instance->cursor_bo);
+	ret = at_device_mode_set_cursor(&instance->device, instance->cursor_buf);
 	if (ret < 0)
 		fprintf(stderr, "Error setting the cursor.\n");
 
@@ -701,27 +724,15 @@ at_instance_modeset_restore(struct at_instance *instance)
 }
 
 static void
-fill_dumb(struct at_dumb_buffer *dumb, uint32_t color)
-{
-	int i, j;
-
-	for (i = 0; i < dumb->height; i++) {
-		uint32_t *pixel = (uint32_t *)(dumb->data + i * dumb->pitch);
-		for (j = 0; j < dumb->width; j++)
-			pixel[j] = color;
-	}
-}
-
-static void
 at_draw_frame(struct at_instance *instance)
 {
 	static uint32_t color = 0;
 	int ret;
 	uint32_t next_fb = (instance->cur_fb + 1) % ATOMICTEST_NUM_FBS;
 
-	fill_dumb(instance->fbs[next_fb], color++);
+	at_dumb_buffer_fill(instance->fbs[next_fb]->dumb, color++);
 
-	at_gbm_bo_fill(instance->cursor_bo, -color | 0xFF000000);
+	at_dumb_buffer_fill(instance->cursor_buf, ~color | 0xFF000000);
 
 	ret = drmModePageFlip(instance->device.fd, instance->device.crtc,
 			instance->fbs[next_fb]->fb_id,
