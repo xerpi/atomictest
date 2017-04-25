@@ -27,7 +27,12 @@ struct at_device {
 	uint16_t height;
 
 	uint32_t connector;
-	uint32_t crtc;
+	uint32_t crtc_id;
+	uint32_t crtc_idx;
+
+	/* possible overlay planes for crtc_id */
+	uint32_t overlays_count;
+	uint32_t *overlay_ids;
 
 	drmModeCrtc *saved_crtc;
 };
@@ -39,8 +44,6 @@ struct at_dumb_buffer {
 	uint32_t handle;
 	uint32_t pitch;
 	uint64_t size;
-
-	uint32_t fb_id;
 
 	uint8_t *data;
 };
@@ -54,6 +57,7 @@ struct at_instance {
 	struct at_device device;
 	struct at_dumb_fb *fbs[ATOMICTEST_NUM_FBS];
 	struct at_dumb_buffer *cursor_buf;
+	struct at_dumb_fb **overlay_fbs;
 
 	uint32_t cur_fb;
 	bool run;
@@ -93,7 +97,15 @@ setup_device(struct at_device *device, drmModeRes *resources,
 		if (encoder->crtc_id) {
 			printf("  the encoder is connected to the CRTC %d\n",
 				encoder->crtc_id);
-			device->crtc = encoder->crtc_id;
+			device->crtc_id = encoder->crtc_id;
+
+			for (i = 0; i < resources->count_crtcs; i++) {
+				if (resources->crtcs[i] == device->crtc_id) {
+					device->crtc_idx = i;
+					break;
+				}
+			}
+
 			drmModeFreeEncoder(encoder);
 			return 0;
 		}
@@ -113,7 +125,8 @@ setup_device(struct at_device *device, drmModeRes *resources,
 
 			printf("  crtc %d is available to this encoder\n", j);
 
-			device->crtc = resources->crtcs[j];
+			device->crtc_id = resources->crtcs[j];
+			device->crtc_idx = j;
 			drmModeFreeEncoder(encoder);
 			return 0;
 		}
@@ -122,6 +135,61 @@ setup_device(struct at_device *device, drmModeRes *resources,
 	}
 
 	return -1;
+}
+
+static bool
+is_overlay(int fd, drmModePlanePtr plane)
+{
+	int i;
+	drmModeObjectPropertiesPtr props;
+	bool overlay = false;
+
+	props = drmModeObjectGetProperties(fd, plane->plane_id, DRM_MODE_OBJECT_PLANE);
+	if (!props)
+		return false;
+
+	for (i = 0; i < props->count_props; i++) {
+		drmModePropertyPtr prop = drmModeGetProperty(fd, props->props[i]);
+		if (!prop)
+			continue;
+
+		if (!strcmp(prop->name, "type") && props->prop_values[i] == DRM_PLANE_TYPE_OVERLAY) {
+			drmModeFreeProperty(prop);
+			overlay = true;
+			break;
+		}
+
+		drmModeFreeProperty(prop);
+	}
+
+	drmModeFreeObjectProperties(props);
+
+	return overlay;
+}
+
+static void
+setup_planes(struct at_device *device, drmModePlaneRes *plane_res)
+{
+	int i;
+
+	device->overlays_count = 0;
+	device->overlay_ids = NULL;
+
+	for (i = 0; i < plane_res->count_planes; i++) {
+		drmModePlanePtr plane = drmModeGetPlane(device->fd, plane_res->planes[i]);
+		if (!plane)
+			continue;
+
+		if ((plane->possible_crtcs & (1 << device->crtc_idx)) &&
+		    is_overlay(device->fd, plane)) {
+			device->overlay_ids = realloc(device->overlay_ids, sizeof(*device->overlay_ids) *
+						      (device->overlays_count + 1));
+			device->overlay_ids[device->overlays_count] = plane->plane_id;
+			device->overlays_count++;
+		}
+
+		drmModeFreePlane(plane);
+	}
 }
 
 int
@@ -170,8 +238,6 @@ at_device_open(struct at_device *device, const char *node)
 	printf("Device connectors: %d\n", resources->count_connectors);
 
 	plane_res = drmModeGetPlaneResources(device->fd);
-	printf("Device planes: %d\n", plane_res->count_planes);
-	drmModeFreePlaneResources(plane_res);
 
 	/*
 	 * Get the first connected connector.
@@ -216,18 +282,22 @@ at_device_open(struct at_device *device, const char *node)
 			continue;
 		}
 
+		setup_planes(device, plane_res);
+
 		memcpy(&device->mode, &connector->modes[0], sizeof(device->mode));
 		device->width = connector->modes[0].hdisplay;
 		device->height = connector->modes[0].vdisplay;
 		device->connector = connector->connector_id;
 		device->saved_crtc = NULL;
 
+		drmModeFreePlaneResources(plane_res);
 		drmModeFreeConnector(connector);
 		drmModeFreeResources(resources);
 
 		return 0;
 	}
 
+	drmModeFreePlaneResources(plane_res);
 	drmModeFreeResources(resources);
 	close(fd);
 
@@ -237,6 +307,7 @@ at_device_open(struct at_device *device, const char *node)
 int
 at_device_close(struct at_device *device)
 {
+	free(device->overlay_ids);
 	close(device->fd);
 	return 0;
 }
@@ -250,7 +321,6 @@ at_dumb_buffer_create(struct at_device *device, uint16_t width,
 	struct drm_mode_create_dumb create_dumb;
 	struct drm_mode_destroy_dumb destroy_dumb;
 	struct drm_mode_map_dumb map_dumb;
-	uint32_t handles[4] = { 0 }, pitches[4] = { 0 }, offsets[4] = { 0 };
 
 	dumb = malloc(sizeof(*dumb));
 	if (!dumb)
@@ -272,14 +342,6 @@ at_dumb_buffer_create(struct at_device *device, uint16_t width,
 	dumb->pitch = create_dumb.pitch;
 	dumb->size = create_dumb.size;
 
-	handles[0] = dumb->handle;
-	pitches[0] = dumb->pitch;
-	offsets[0] = 0;
-	ret = drmModeAddFB2(device->fd, width, height, format,
-			    handles, pitches, offsets, &dumb->fb_id, 0);
-	if (ret)
-		goto err_add;
-
 	memset(&map_dumb, 0, sizeof(map_dumb));
 	map_dumb.handle = dumb->handle;
 
@@ -298,8 +360,6 @@ at_dumb_buffer_create(struct at_device *device, uint16_t width,
 	return dumb;
 
 err_map:
-	drmModeRmFB(device->fd, dumb->fb_id);
-err_add:
 	memset(&destroy_dumb, 0, sizeof(destroy_dumb));
 	destroy_dumb.handle = create_dumb.handle;
 	drmIoctl(device->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
@@ -315,8 +375,6 @@ at_dumb_buffer_free(struct at_device *device, struct at_dumb_buffer *dumb)
 	struct drm_mode_destroy_dumb destroy_dumb;
 
 	munmap(dumb->data, dumb->size);
-
-	drmModeRmFB(device->fd, dumb->fb_id);
 
 	memset(&destroy_dumb, 0, sizeof(destroy_dumb));
 	destroy_dumb.handle = dumb->handle;
@@ -380,30 +438,37 @@ at_dumb_fb_free(struct at_device *device, struct at_dumb_fb *fb)
 int
 at_device_mode_set_crtc(struct at_device *device, struct at_dumb_fb *fb)
 {
-	return drmModeSetCrtc(device->fd, device->crtc, fb->fb_id, 0, 0,
+	return drmModeSetCrtc(device->fd, device->crtc_id, fb->fb_id, 0, 0,
 			      &device->connector, 1, &device->mode);
 }
 
 int
 at_device_mode_set_cursor(struct at_device *device, struct at_dumb_buffer *dumb)
 {
-	return drmModeSetCursor(device->fd, device->crtc, dumb->handle,
+	return drmModeSetCursor(device->fd, device->crtc_id, dumb->handle,
 				dumb->width, dumb->height);
 }
 
 int
 at_device_mode_move_cursor(struct at_device *device, int x, int y)
 {
-	return drmModeMoveCursor(device->fd, device->crtc, x, y);
+	return drmModeMoveCursor(device->fd, device->crtc_id, x, y);
 }
 
 int
 at_device_modeset_restore(struct at_device *device, bool restore_crtc)
 {
+	int i;
 	int ret = 0;
 
 	if (!device->saved_crtc)
 		return -1;
+
+	drmModeSetCursor(device->fd, device->crtc_id, 0, 0, 0);
+
+	for (i = 0; i < device->overlays_count; i++)
+		drmModeSetPlane(device->fd, device->overlay_ids[i],
+				device->crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
 	if (restore_crtc)
 		ret = drmModeSetCrtc(device->fd, device->saved_crtc->crtc_id,
@@ -430,7 +495,7 @@ at_device_modeset_save(struct at_device *device)
 			return ret;
 	}
 
-	device->saved_crtc = drmModeGetCrtc(device->fd, device->crtc);
+	device->saved_crtc = drmModeGetCrtc(device->fd, device->crtc_id);
 
 	return 0;
 }
@@ -564,7 +629,7 @@ at_instance_libinput_close(struct at_instance *instance)
 struct at_instance *
 at_instance_create(const char *node)
 {
-	int i, j;
+	int i, j, k;
 	struct at_instance *instance;
 	uint64_t cursor_width, cursor_height;
 
@@ -602,8 +667,24 @@ at_instance_create(const char *node)
 		}
 	}
 
-	if (at_instance_libinput_init(instance) < 0)
+	instance->overlay_fbs = calloc(instance->device.overlays_count,
+				       sizeof(*instance->overlay_fbs));
+	if (!instance->overlay_fbs)
 		goto err_free_fbs;
+
+	for (j = 0; j < instance->device.overlays_count; j++) {
+		instance->overlay_fbs[j] = at_dumb_fb_create(&instance->device,
+							     128,
+							     128,
+							     DRM_FORMAT_XRGB8888);
+		if (!instance->overlay_fbs[j]) {
+			fprintf(stderr, "Couldn't create dumb buffer.\n");
+			goto err_free_overlays;
+		}
+	}
+
+	if (at_instance_libinput_init(instance) < 0)
+		goto err_free_overlays;
 
 	instance->cur_fb = 0;
 	instance->run = true;
@@ -614,6 +695,9 @@ at_instance_create(const char *node)
 
 	return instance;
 
+err_free_overlays:
+	for (k = 0; k < j; k++)
+		at_dumb_fb_free(&instance->device, instance->overlay_fbs[k]);
 err_free_fbs:
 	for (j = 0; j < i; j++)
 		at_dumb_fb_free(&instance->device, instance->fbs[j]);
@@ -632,6 +716,9 @@ at_instance_destroy(struct at_instance *instance)
 	int i;
 
 	at_instance_libinput_close(instance);
+
+	for (i = 0; i < instance->device.overlays_count; i++)
+		at_dumb_fb_free(&instance->device, instance->overlay_fbs[i]);
 
 	for (i = 0; i < ATOMICTEST_NUM_FBS; i++)
 		at_dumb_fb_free(&instance->device, instance->fbs[i]);
@@ -724,7 +811,32 @@ at_instance_modeset_restore(struct at_instance *instance)
 }
 
 static void
-at_draw_frame(struct at_instance *instance)
+at_instance_set_overlays(struct at_instance *instance)
+{
+	int i, ret;
+
+	for (i = 0; i <  instance->device.overlays_count; i++) {
+		struct at_dumb_buffer *dumb = instance->overlay_fbs[i]->dumb;
+		uint32_t width = dumb->width;
+		uint32_t height = dumb->height;
+
+		at_dumb_buffer_fill(dumb, 0xFF000000 | (0xFF0000 >> i * 8));
+
+		/* Under-spec'ed, might block until the vblank occurs! */
+		ret = drmModeSetPlane(instance->device.fd,
+				instance->device.overlay_ids[i],
+				instance->device.crtc_id,
+				instance->overlay_fbs[i]->fb_id, 0,
+				instance->device.width - instance->cursor_x - width,
+				instance->device.height - instance->cursor_y - height,
+				width, height,
+				0 << 16, 0 << 16,
+				width << 16, height << 16);
+	}
+}
+
+static void
+at_instance_draw_frame(struct at_instance *instance)
 {
 	static uint32_t color = 0;
 	int ret;
@@ -734,7 +846,9 @@ at_draw_frame(struct at_instance *instance)
 
 	at_dumb_buffer_fill(instance->cursor_buf, ~color | 0xFF000000);
 
-	ret = drmModePageFlip(instance->device.fd, instance->device.crtc,
+	at_instance_set_overlays(instance);
+
+	ret = drmModePageFlip(instance->device.fd, instance->device.crtc_id,
 			instance->fbs[next_fb]->fb_id,
 			DRM_MODE_PAGE_FLIP_EVENT, instance);
 	if (!ret) {
@@ -752,7 +866,7 @@ at_page_flip_handler(int fd, unsigned int sequence, unsigned int tv_sec,
 	instance->flip_pending = false;
 
 	if (instance->run)
-		at_draw_frame(instance);
+		at_instance_draw_frame(instance);
 }
 
 int
@@ -774,7 +888,7 @@ main(int argc, char *argv[])
 	if (at_instance_modeset_apply(instance) < 0)
 		goto err_modeset_apply;
 
-	at_draw_frame(instance);
+	at_instance_draw_frame(instance);
 
 	while (run) {
 		if (at_instance_process_events(instance) < 0)
