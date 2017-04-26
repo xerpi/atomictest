@@ -821,11 +821,11 @@ at_instance_set_overlays(struct at_instance *instance)
 		struct at_dumb_buffer *dumb = instance->overlay_fbs[i]->dumb;
 		uint32_t width = dumb->width;
 		uint32_t height = dumb->height;
-		float angle_offset = (M_PI * 2) * instance->device.overlays_count;
+		float angle_offset = ((M_PI * 2) / instance->device.overlays_count) * i;
 		int32_t x = cosf(angle + angle_offset) * 256.0f;
 		int32_t y = sinf(angle + angle_offset) * 256.0f;
 
-		at_dumb_buffer_fill(dumb, 0xFF000000 | (0xFF0000 >> i * 8));
+		at_dumb_buffer_fill(dumb, 0xFF000000 | (0xFF0000 >> (i % 3) * 8));
 
 		/* Under-spec'ed, might block until the vblank occurs! */
 		ret = drmModeSetPlane(instance->device.fd,
