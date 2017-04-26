@@ -3,6 +3,7 @@ AM_INIT_AUTOMAKE([foreign -Wall])
 AC_PROG_CC
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_FILES([Makefile src/Makefile])
+AC_CHECK_LIB([m], [main])
 PKG_CHECK_MODULES(DRM, libdrm)
 PKG_CHECK_MODULES(LIBUDEV, [libudev >= 136])
 PKG_CHECK_MODULES(LIBINPUT, [libinput >= 0.8.0])

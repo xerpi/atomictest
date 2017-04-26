@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include <stdbool.h>
 #include <errno.h>
 #include <unistd.h>
@@ -813,12 +814,16 @@ at_instance_modeset_restore(struct at_instance *instance)
 static void
 at_instance_set_overlays(struct at_instance *instance)
 {
+	static float angle = 0.0f;
 	int i, ret;
 
 	for (i = 0; i <  instance->device.overlays_count; i++) {
 		struct at_dumb_buffer *dumb = instance->overlay_fbs[i]->dumb;
 		uint32_t width = dumb->width;
 		uint32_t height = dumb->height;
+		float angle_offset = (M_PI * 2) * instance->device.overlays_count;
+		int32_t x = cosf(angle + angle_offset) * 256.0f;
+		int32_t y = sinf(angle + angle_offset) * 256.0f;
 
 		at_dumb_buffer_fill(dumb, 0xFF000000 | (0xFF0000 >> i * 8));
 
@@ -827,12 +832,14 @@ at_instance_set_overlays(struct at_instance *instance)
 				instance->device.overlay_ids[i],
 				instance->device.crtc_id,
 				instance->overlay_fbs[i]->fb_id, 0,
-				instance->device.width - instance->cursor_x - width,
-				instance->device.height - instance->cursor_y - height,
+				instance->device.width / 2 + x - width / 2,
+				instance->device.height / 2 + y - height / 2,
 				width, height,
 				0 << 16, 0 << 16,
 				width << 16, height << 16);
 	}
+
+	angle += 0.1f;
 }
 
 static void
