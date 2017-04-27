@@ -1035,13 +1035,14 @@ at_instance_atomic_commit(struct at_instance *instance, uint32_t fb_idx,
 
 	for (i = 0; i < instance->device.overlay_count; i++) {
 		struct at_drm_plane *overlay = instance->device.overlay_planes[i];
-		uint32_t width = instance->overlay_fbs[i]->dumb->width;
-		uint32_t height = instance->overlay_fbs[i]->dumb->height;
+		struct at_dumb_fb *overlay_fb = instance->overlay_fbs[i];
+		uint32_t width = overlay_fb->dumb->width;
+		uint32_t height = overlay_fb->dumb->height;
 		int32_t x = instance->device.width / 2 + instance->overlay_pos[i].x - width / 2;
 		int32_t y = instance->device.height / 2 + instance->overlay_pos[i].y - height / 2;
 
 		at_drm_plane_set_properties(req, overlay,
-					    device->crtc->crtc_id, instance->overlay_fbs[i]->fb_id,
+					    device->crtc->crtc_id, overlay_fb->fb_id,
 					    x, y,
 					    width, height,
 					    0, 0,
