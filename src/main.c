@@ -61,6 +61,8 @@ struct at_device {
 	struct at_drm_plane **overlay_planes;
 	uint32_t overlay_count;
 
+	uint32_t blob_id;
+
 	drmModeCrtc *saved_crtc;
 };
 
@@ -488,6 +490,10 @@ at_device_open(struct at_device *device, const char *node)
 		memcpy(&device->mode, &connector->modes[0], sizeof(device->mode));
 		device->width = connector->modes[0].hdisplay;
 		device->height = connector->modes[0].vdisplay;
+
+		drmModeCreatePropertyBlob(device->fd, &device->mode,
+					  sizeof(device->mode), &device->blob_id);
+
 		device->saved_crtc = NULL;
 
 		drmModeFreePlaneResources(plane_res);
@@ -508,6 +514,8 @@ int
 at_device_close(struct at_device *device)
 {
 	int i, j;
+
+	drmModeDestroyPropertyBlob(device->fd, device->blob_id);
 
 	for (i = 0; i < device->plane_count; i++) {
 		at_drm_properties_free(&device->planes[i]->properties);
@@ -993,19 +1001,15 @@ at_instance_atomic_commit(struct at_instance *instance, uint32_t fb_idx,
 		return -1;
 
 	if (flags & DRM_MODE_ATOMIC_ALLOW_MODESET) {
-		uint32_t blob_id;
 
 		if (at_drm_properties_add_property(req, device->connector->connector_id,
 						   &device->connector->properties,
 						   "CRTC_ID", device->crtc->crtc_id) < 0)
 			goto err_free_req;
 
-		drmModeCreatePropertyBlob(device->fd, &device->mode, sizeof(device->mode),
-				     &blob_id);
-
 		if (at_drm_properties_add_property(req, device->crtc->crtc_id,
 						   &device->crtc->properties,
-						   "MODE_ID", blob_id) < 0)
+						   "MODE_ID", device->blob_id) < 0)
 			goto err_free_req;
 
 		if (at_drm_properties_add_property(req, device->crtc->crtc_id,
