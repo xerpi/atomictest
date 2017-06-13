@@ -225,14 +225,6 @@ at_device_open(struct at_device *device, const char *node)
 
 	device->fd = fd;
 
-	ret = drmSetClientCap(device->fd, DRM_CLIENT_CAP_ATOMIC, 1);
-	if (ret < 0) {
-		fprintf(stderr, "Error: the device doesn't support atomic.\n");
-		drmModeFreeResources(resources);
-		close(fd);
-		return -1;
-	}
-
 	printf("Device fbs: %d\n", resources->count_fbs);
 	printf("Device crtcs: %d\n", resources->count_crtcs);
 	printf("Device encoders: %d\n", resources->count_encoders);
