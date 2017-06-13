@@ -847,11 +847,17 @@ at_instance_draw_frame(struct at_instance *instance)
 {
 	static uint32_t color = 0;
 	int ret;
+	uint32_t component;
+	uint32_t primary_rgb;
+	uint32_t cursor_rgb;
 	uint32_t next_fb = (instance->cur_fb + 1) % ATOMICTEST_NUM_FBS;
 
-	at_dumb_buffer_fill(instance->fbs[next_fb]->dumb, color++);
+	component = (0xFFlu - abs(color++ % (2 * 0xFFlu) - 0xFFlu));
+	primary_rgb = component | component << 16;
+	cursor_rgb = ~component;
 
-	at_dumb_buffer_fill(instance->cursor_buf, ~color | 0xFF000000);
+	at_dumb_buffer_fill(instance->fbs[next_fb]->dumb, 0xFF000000 | primary_rgb);
+	at_dumb_buffer_fill(instance->cursor_buf, 0xFF000000 | cursor_rgb);
 
 	at_instance_set_overlays(instance);
 
