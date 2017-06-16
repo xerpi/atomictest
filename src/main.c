@@ -182,6 +182,7 @@ static void
 setup_planes(struct at_device *device, drmModePlaneRes *plane_res)
 {
 	int i;
+	uint32_t plane_count = 0;
 
 	device->overlays_count = 0;
 	device->overlay_ids = NULL;
@@ -199,8 +200,13 @@ setup_planes(struct at_device *device, drmModePlaneRes *plane_res)
 			device->overlays_count++;
 		}
 
+		plane_count++;
+
 		drmModeFreePlane(plane);
 	}
+
+	printf("Number of total planes for the CRTC: %d\n", plane_count);
+	printf("Number of overlay planes for the CRTC: %d\n", device->overlays_count);
 }
 
 int
