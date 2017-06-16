@@ -19,6 +19,7 @@
 #include <linux/input.h>
 #include <config.h>
 
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define TIMESPEC_NSEC(t) ((uint64_t)(t).tv_sec * 1000000000 + (t).tv_nsec)
 
 #define ATOMICTEST_NUM_FBS 2
@@ -62,7 +63,7 @@ struct at_device {
 	struct at_drm_plane *primary_plane;
 	struct at_drm_plane *cursor_plane;
 	struct at_drm_plane **overlay_planes;
-	uint32_t overlay_count;
+	uint32_t overlays_count;
 
 	uint32_t blob_id;
 
@@ -107,7 +108,11 @@ struct at_instance {
 	} *overlay_pos;
 
 	uint64_t frames;
+	uint32_t num_overlays_use;
 };
+
+void
+at_instance_set_num_overlays_use(struct at_instance *instance, int num);
 
 static bool run = true;
 
@@ -297,12 +302,12 @@ add_plane(struct at_device *device, drmModePlane *plane)
 	} else if (plane_type == DRM_PLANE_TYPE_OVERLAY) {
 		device->overlay_planes = realloc(device->overlay_planes,
 						 sizeof(*device->overlay_planes) *
-						(device->overlay_count + 1));
+						(device->overlays_count + 1));
 		if (!device->overlay_planes)
 			return false;
 
-		device->overlay_planes[device->overlay_count] = device->planes[cnt];
-		device->overlay_count++;
+		device->overlay_planes[device->overlays_count] = device->planes[cnt];
+		device->overlays_count++;
 	}
 
 	device->planes[cnt]->plane_id = plane->plane_id;
@@ -321,7 +326,7 @@ setup_planes(struct at_device *device, drmModePlaneRes *plane_res)
 	device->primary_plane = NULL;
 	device->cursor_plane = NULL;
 	device->overlay_planes = NULL;
-	device->overlay_count = 0;
+	device->overlays_count = 0;
 
 	for (i = 0; i < plane_res->count_planes; i++) {
 		drmModePlane *plane = drmModeGetPlane(device->fd, plane_res->planes[i]);
@@ -674,7 +679,7 @@ at_device_modeset_restore(struct at_device *device, bool restore_crtc)
 
 	drmModeSetCursor(device->fd, device->crtc->crtc_id, 0, 0, 0);
 
-	for (i = 0; i < device->overlay_count; i++)
+	for (i = 0; i < device->overlays_count; i++)
 		drmModeSetPlane(device->fd, device->overlay_planes[i]->plane_id,
 				device->crtc->crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
@@ -728,14 +733,23 @@ static const struct libinput_interface at_libinput_if = {
 static void
 at_instance_li_handle_key_event(struct at_instance *instance, struct libinput_event *ev)
 {
+	uint32_t key;
 	struct libinput_event_keyboard *kev =
 		libinput_event_get_keyboard_event(ev);
 	if (!kev)
 		return;
 
-	switch (libinput_event_keyboard_get_key(kev)) {
+	key = libinput_event_keyboard_get_key(kev);
+
+	switch (key) {
 	case KEY_Q:
 		run = 0;
+		break;
+	case KEY_0:
+		at_instance_set_num_overlays_use(instance, 0);
+		break;
+	case KEY_1 ... KEY_9:
+		at_instance_set_num_overlays_use(instance, (key - KEY_1) + 1);
 		break;
 	}
 }
@@ -872,12 +886,12 @@ at_instance_create(const char *node)
 		}
 	}
 
-	instance->overlay_fbs = calloc(instance->device.overlay_count,
+	instance->overlay_fbs = calloc(instance->device.overlays_count,
 				       sizeof(*instance->overlay_fbs));
 	if (!instance->overlay_fbs)
 		goto err_free_fbs;
 
-	for (j = 0; j < instance->device.overlay_count; j++) {
+	for (j = 0; j < instance->device.overlays_count; j++) {
 		instance->overlay_fbs[j] = at_dumb_fb_create(&instance->device,
 							     128,
 							     128,
@@ -888,7 +902,7 @@ at_instance_create(const char *node)
 		}
 	}
 
-	instance->overlay_pos = calloc(instance->device.overlay_count,
+	instance->overlay_pos = calloc(instance->device.overlays_count,
 				       sizeof(*instance->overlay_pos));
 	if (!instance->overlay_pos)
 		goto err_free_overlays;
@@ -903,6 +917,7 @@ at_instance_create(const char *node)
 	instance->cursor_x = instance->device.width / 2;
 	instance->cursor_y = instance->device.height / 2;
 	instance->frames = 0;
+	instance->num_overlays_use = instance->device.overlays_count;
 
 	return instance;
 
@@ -929,6 +944,15 @@ at_instance_get_frames(struct at_instance *instance)
 	return instance->frames;
 }
 
+void
+at_instance_set_num_overlays_use(struct at_instance *instance, int num)
+{
+	if (num < 0)
+		instance->num_overlays_use = instance->device.overlays_count;
+	else
+		instance->num_overlays_use = MIN(num, instance->device.overlays_count);
+}
+
 int
 at_instance_destroy(struct at_instance *instance)
 {
@@ -938,7 +962,7 @@ at_instance_destroy(struct at_instance *instance)
 
 	free(instance->overlay_pos);
 
-	for (i = 0; i < instance->device.overlay_count; i++)
+	for (i = 0; i < instance->device.overlays_count; i++)
 		at_dumb_fb_free(&instance->device, instance->overlay_fbs[i]);
 
 	for (i = 0; i < ATOMICTEST_NUM_FBS; i++)
@@ -1045,7 +1069,7 @@ at_instance_atomic_commit(struct at_instance *instance, uint32_t fb_idx,
 				    0, 0,
 				    cursor_width << 16, cursor_height << 16);
 
-	for (i = 0; i < instance->device.overlay_count; i++) {
+	for (i = 0; i < instance->num_overlays_use; i++) {
 		struct at_drm_plane *overlay = instance->device.overlay_planes[i];
 		struct at_dumb_fb *overlay_fb = instance->overlay_fbs[i];
 		uint32_t width = overlay_fb->dumb->width;
@@ -1059,6 +1083,17 @@ at_instance_atomic_commit(struct at_instance *instance, uint32_t fb_idx,
 					    width, height,
 					    0, 0,
 					    width << 16, height << 16);
+	}
+
+	for (; i < instance->device.overlays_count; i++) {
+		struct at_drm_plane *overlay = instance->device.overlay_planes[i];
+
+		at_drm_plane_set_properties(req, overlay,
+					    0, 0,
+					    0, 0,
+					    0, 0,
+					    0, 0,
+					    0, 0);
 	}
 
 	ret = drmModeAtomicCommit(device->fd, req, flags, data);
@@ -1108,11 +1143,11 @@ at_instance_update_overlays(struct at_instance *instance)
 	static float angle = 0.0f;
 	int i, ret;
 
-	for (i = 0; i <  instance->device.overlay_count; i++) {
+	for (i = 0; i <  instance->device.overlays_count; i++) {
 		struct at_dumb_buffer *dumb = instance->overlay_fbs[i]->dumb;
 		uint32_t width = dumb->width;
 		uint32_t height = dumb->height;
-		float angle_offset = ((M_PI * 2) / instance->device.overlay_count) * i;
+		float angle_offset = ((M_PI * 2) / instance->device.overlays_count) * i;
 
 		instance->overlay_pos[i].x = cosf(angle + angle_offset) * 256.0f;
 		instance->overlay_pos[i].y = sinf(angle + angle_offset) * 256.0f;
@@ -1188,6 +1223,11 @@ main(int argc, char *argv[])
 
 	if (at_instance_modeset_apply(instance) < 0)
 		goto err_modeset_apply;
+
+	if (argc > 1) {
+		at_instance_set_num_overlays_use(instance,
+						  strtol(argv[1], NULL, 10));
+	}
 
 	clock_gettime(CLOCK_MONOTONIC, &start_time);
 
