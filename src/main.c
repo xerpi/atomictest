@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -17,6 +18,8 @@
 #include <libinput.h>
 #include <linux/input.h>
 #include <config.h>
+
+#define TIMESPEC_NSEC(t) ((uint64_t)(t).tv_sec * 1000000000 + (t).tv_nsec)
 
 #define ATOMICTEST_NUM_FBS 2
 
@@ -102,6 +105,8 @@ struct at_instance {
 		int32_t x;
 		int32_t y;
 	} *overlay_pos;
+
+	uint64_t frames;
 };
 
 static bool run = true;
@@ -897,6 +902,7 @@ at_instance_create(const char *node)
 	instance->crtc_changed = false;
 	instance->cursor_x = instance->device.width / 2;
 	instance->cursor_y = instance->device.height / 2;
+	instance->frames = 0;
 
 	return instance;
 
@@ -915,6 +921,12 @@ err_open:
 	free(instance);
 
 	return NULL;
+}
+
+uint64_t
+at_instance_get_frames(struct at_instance *instance)
+{
+	return instance->frames;
 }
 
 int
@@ -1148,6 +1160,7 @@ at_page_flip_handler(int fd, unsigned int sequence, unsigned int tv_sec,
 	struct at_instance *instance = user_data;
 
 	instance->flip_pending = false;
+	instance->frames++;
 
 	if (instance->run)
 		at_instance_draw_frame(instance);
@@ -1157,6 +1170,10 @@ int
 main(int argc, char *argv[])
 {
 	struct at_instance *instance;
+	struct timespec start_time;
+	struct timespec end_time;
+	double delta_sec;
+	uint64_t frames;
 
 	signal(SIGINT, sigint_handler);
 
@@ -1172,6 +1189,8 @@ main(int argc, char *argv[])
 	if (at_instance_modeset_apply(instance) < 0)
 		goto err_modeset_apply;
 
+	clock_gettime(CLOCK_MONOTONIC, &start_time);
+
 	at_instance_draw_frame(instance);
 
 	while (run) {
@@ -1180,6 +1199,14 @@ main(int argc, char *argv[])
 	}
 
 	at_instance_stop(instance);
+
+	clock_gettime(CLOCK_MONOTONIC, &end_time);
+
+	frames = at_instance_get_frames(instance);
+	delta_sec = (TIMESPEC_NSEC(end_time) - TIMESPEC_NSEC(start_time)) / 1000000000.0;
+
+	printf("\n%llu frames in %f seconds = %f FPS\n", frames, delta_sec, frames / delta_sec);
+
 	at_instance_modeset_restore(instance);
 	at_instance_destroy(instance);
 
