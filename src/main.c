@@ -251,7 +251,7 @@ at_device_open(struct at_device *device, const char *node)
 	/*
 	 * Get the first connected connector.
 	 */
-	for (i = 0; i < resources->count_connectors; i++) {
+	for (i = resources->count_connectors - 1; i >= 0; i--) {
 		drmModeConnector *connector;
 
 		printf("\nTrying connector %d...\n", i);
